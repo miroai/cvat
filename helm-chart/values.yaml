@@ -117,6 +117,8 @@ cvat:
     imagePullPolicy: Always
     permissionFix:
       enabled: true
+      paths:
+        - /home/django
     service:
       annotations:
         traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
