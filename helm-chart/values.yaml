@@ -117,6 +117,7 @@ cvat:
     imagePullPolicy: Always
     permissionFix:
       enabled: true
+      # commandOverride: []
       paths:
         - /home/django
     service:
