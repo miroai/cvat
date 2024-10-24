@@ -11,11 +11,11 @@ from rest_framework.permissions import SAFE_METHODS
 from rest_framework.response import Response
 
 from cvat.apps.engine.view_utils import list_action, make_paginated_response
-from cvat.apps.iam.permissions import WebhookPermission
 from cvat.apps.iam.filters import ORGANIZATION_OPEN_API_PARAMETERS
 
 from .event_type import AllEvents, OrganizationEvents, ProjectEvents
 from .models import Webhook, WebhookDelivery, WebhookTypeChoice
+from .permissions import WebhookPermission
 from .serializers import (EventsSerializer, WebhookDeliveryReadSerializer,
                           WebhookReadSerializer, WebhookWriteSerializer)
 from .signals import signal_ping, signal_redelivery
@@ -109,7 +109,9 @@ class WebhookViewSet(viewsets.ModelViewSet):
         ],
         responses={"200": OpenApiResponse(EventsSerializer)},
     )
-    @action(detail=False, methods=["GET"], serializer_class=EventsSerializer)
+    @action(detail=False, methods=["GET"], serializer_class=EventsSerializer,
+        permission_classes=[],
+    )
     def events(self, request):
         webhook_type = request.query_params.get("type", "all")
         events = None

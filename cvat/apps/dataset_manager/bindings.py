@@ -6,38 +6,50 @@
 from __future__ import annotations
 
 import os.path as osp
+import re
 import sys
-from collections import namedtuple
 from functools import reduce
 from operator import add
 from pathlib import Path
 from types import SimpleNamespace
-from typing import (Any, Callable, DefaultDict, Dict, Iterable, List, Literal, Mapping,
+from typing import (Any, Callable, DefaultDict, Dict, Iterable, Iterator, List, Literal, Mapping,
                     NamedTuple, Optional, OrderedDict, Sequence, Set, Tuple, Union)
 
+from attrs.converters import to_bool
 import datumaro as dm
 import defusedxml.ElementTree as ET
-import numpy as np
 import rq
 from attr import attrib, attrs
 from datumaro.components.media import PointCloud
+from datumaro.components.environment import Environment
+from datumaro.components.extractor import Importer
+from datumaro.components.format_detection import RejectionReason
 from django.db.models import QuerySet
 from django.utils import timezone
+from django.conf import settings
 
 from cvat.apps.dataset_manager.formats.utils import get_label_color
 from cvat.apps.dataset_manager.util import add_prefetch_fields
-from cvat.apps.engine.frame_provider import FrameProvider
-from cvat.apps.engine.models import (AttributeSpec, AttributeType, Data, DimensionType, Job,
+from cvat.apps.engine import models
+from cvat.apps.engine.frame_provider import TaskFrameProvider, FrameQuality, FrameOutputType
+from cvat.apps.engine.models import (AttributeSpec, AttributeType, DimensionType, Job,
                                      JobType, Label, LabelType, Project, SegmentType, ShapeType,
                                      Task)
+from cvat.apps.engine.rq_job_handler import RQJobMetaField
+from cvat.apps.engine.lazy_list import LazyList
 
 from .annotation import AnnotationIR, AnnotationManager, TrackManager
-from .formats.transformations import CVATRleToCOCORle, EllipsesToMasks
+from .formats.transformations import MaskConverter, EllipsesToMasks
+from ..engine.log import ServerLogManager
+
+slogger = ServerLogManager(__name__)
 
 CVAT_INTERNAL_ATTRIBUTES = {'occluded', 'outside', 'keyframe', 'track_id', 'rotation'}
 
 class InstanceLabelData:
-    Attribute = NamedTuple('Attribute', [('name', str), ('value', Any)])
+    class Attribute(NamedTuple):
+        name: str
+        value: Any
 
     @classmethod
     def add_prefetch_info(cls, queryset: QuerySet):
@@ -182,26 +194,82 @@ class InstanceLabelData:
         return exported_attributes
 
 class CommonData(InstanceLabelData):
-    Shape = namedtuple("Shape", 'id, label_id')  # 3d
-    LabeledShape = namedtuple(
-        'LabeledShape', 'type, frame, label, points, occluded, attributes, source, rotation, group, z_order, elements, outside, id')
-    LabeledShape.__new__.__defaults__ = (0, 0, 0, [], False, None)
-    TrackedShape = namedtuple(
-        'TrackedShape', 'type, frame, points, occluded, outside, keyframe, attributes, rotation, source, group, z_order, label, track_id, elements, id')
-    TrackedShape.__new__.__defaults__ = (0, 'manual', 0, 0, None, 0, [], None)
-    Track = namedtuple('Track', 'label, group, source, shapes, elements, id')
-    Track.__new__.__defaults__ = ([], None)
-    Tag = namedtuple('Tag', 'frame, label, attributes, source, group, id')
-    Tag.__new__.__defaults__ = (0, None)
-    Frame = namedtuple(
-        'Frame', 'idx, id, frame, name, width, height, labeled_shapes, tags, shapes, labels')
-    Label = namedtuple('Label', 'id, name, color, type')
+    class Shape(NamedTuple):
+        id: int
+        label_id: int
+
+    class LabeledShape(NamedTuple):
+        type: int
+        frame: int
+        label: int
+        points: Sequence[int]
+        occluded: bool
+        attributes: Sequence[CommonData.Attribute]
+        source: str | None
+        rotation: float = 0
+        group: int = 0
+        z_order: int = 0
+        elements: Sequence[CommonData.LabeledShape] = ()
+        outside: bool = False
+        id: int | None = None
+
+    class TrackedShape(NamedTuple):
+        type: int
+        frame: int
+        points: Sequence[int]
+        occluded: bool
+        outside: bool
+        keyframe: bool
+        attributes: Sequence[CommonData.Attribute]
+        rotation: float = 0
+        source: str = "manual"
+        group: int = 0
+        z_order: int = 0
+        label: str | None = None
+        track_id: int = 0
+        elements: Sequence[CommonData.TrackedShape] = ()
+        id: int | None = None
+
+    class Track(NamedTuple):
+        label: int
+        group: int
+        source: str
+        shapes: Sequence[CommonData.TrackedShape]
+        elements: Sequence[int] = ()
+        id: int | None = None
+
+    class Tag(NamedTuple):
+        frame: int
+        label: int
+        attributes: Sequence[CommonData.Attribute]
+        source: str | None
+        group: int | None = 0
+        id: int | None = None
+
+    class Frame(NamedTuple):
+        idx: int
+        id: int
+        frame: int
+        name: str
+        width: int
+        height: int
+        labeled_shapes: Sequence[CommonData.LabeledShape]
+        tags: Sequence[CommonData.Tag]
+        shapes: Sequence[CommonData.Shape]
+        labels: Sequence[CommonData.Label]
+        subset: str
+
+    class Label(NamedTuple):
+        id: int
+        name: str
+        color: str | None
+        type: str | None
 
     def __init__(self,
-        annotation_ir,
-        db_task,
+        annotation_ir: AnnotationIR,
+        db_task: Task,
         *,
-        host='',
+        host: str = '',
         create_callback=None,
         use_server_track_ids: bool = False,
         included_frames: Optional[Sequence[int]] = None
@@ -214,9 +282,10 @@ class CommonData(InstanceLabelData):
         self._frame_info = {}
         self._frame_mapping: Dict[str, int] = {}
         self._frame_step = db_task.data.get_frame_step()
-        self._db_data = db_task.data
+        self._db_data: models.Data = db_task.data
         self._use_server_track_ids = use_server_track_ids
         self._required_frames = included_frames
+        self._db_subset = db_task.subset
 
         super().__init__(db_task)
 
@@ -233,9 +302,9 @@ class CommonData(InstanceLabelData):
 
     @property
     def stop(self) -> int:
-        return len(self)
+        return max(0, len(self) - 1)
 
-    def _get_queryset(self):
+    def _get_db_images(self) -> Iterator[models.Image]:
         raise NotImplementedError()
 
     def abs_frame_id(self, relative_id):
@@ -262,17 +331,18 @@ class CommonData(InstanceLabelData):
                     "path": "frame_{:06d}".format(self.abs_frame_id(frame)),
                     "width": self._db_data.video.width,
                     "height": self._db_data.video.height,
+                    "subset": self._db_subset,
                 } for frame in self.rel_range
             }
         else:
-            queryset = self._get_queryset()
             self._frame_info = {
                 self.rel_frame_id(db_image.frame): {
                     "id": db_image.id,
                     "path": db_image.path,
                     "width": db_image.width,
                     "height": db_image.height,
-                } for db_image in queryset
+                    "subset": self._db_subset,
+                } for db_image in self._get_db_images()
             }
 
         self._frame_mapping = {
@@ -367,7 +437,7 @@ class CommonData(InstanceLabelData):
     def _export_track(self, track, idx):
         track['shapes'] = list(filter(lambda x: not self._is_frame_deleted(x['frame']), track['shapes']))
         tracked_shapes = TrackManager.get_interpolated_shapes(
-            track, 0, self.stop, self._annotation_ir.dimension)
+            track, 0, self.stop + 1, self._annotation_ir.dimension)
         for tracked_shape in tracked_shapes:
             tracked_shape["attributes"] += track["attributes"]
             tracked_shape["track_id"] = track["track_id"] if self._use_server_track_ids else idx
@@ -403,6 +473,7 @@ class CommonData(InstanceLabelData):
                 frames[frame] = CommonData.Frame(
                     idx=idx,
                     id=frame_info.get("id", 0),
+                    subset=frame_info["subset"],
                     frame=frame,
                     name=frame_info["path"],
                     height=frame_info["height"],
@@ -420,9 +491,12 @@ class CommonData(InstanceLabelData):
             for idx in sorted(set(self._frame_info) & included_frames):
                 get_frame(idx)
 
-        anno_manager = AnnotationManager(self._annotation_ir)
+        anno_manager = AnnotationManager(
+            self._annotation_ir, dimension=self._annotation_ir.dimension
+        )
         for shape in sorted(
-            anno_manager.to_shapes(self.stop, self._annotation_ir.dimension,
+            anno_manager.to_shapes(
+                self.stop + 1,
                 # Skip outside, deleted and excluded frames
                 included_frames=included_frames,
                 include_outside=False,
@@ -525,7 +599,8 @@ class CommonData(InstanceLabelData):
                 self.soft_attribute_import and attrib.name not in CVAT_INTERNAL_ATTRIBUTES
             )
         ]
-        _shape['points'] = list(map(float, _shape['points']))
+
+        self._ensure_points_converted_to_floats(_shape)
         _shape['elements'] = [self._import_shape(element, label_id) for element in _shape.get('elements', [])]
 
         return _shape
@@ -551,9 +626,34 @@ class CommonData(InstanceLabelData):
                 for attrib in shape['attributes']
                 if self._get_mutable_attribute_id(label_id, attrib.name)
             ]
-            shape['points'] = list(map(float, shape['points']))
+            self._ensure_points_converted_to_floats(shape)
 
         return _track
+
+    def _ensure_points_converted_to_floats(self, shape) -> None:
+        """
+        Historically, there were importers that were not converting points to ints/floats.
+        The only place to make sure that all points in shapes have the right type was this one.
+        However, this does eat up a lot of memory for some reason.
+        (see https://github.com/cvat-ai/cvat/pull/1898)
+
+        So, before we can guarantee that all the importers are returning the right data,
+        we have to have this conversion.
+        """
+        # if points is LazyList or tuple, we can be sure it has the right type already
+        if isinstance(points := shape["points"], LazyList | tuple):
+            return
+
+        for point in points:
+            if not isinstance(point, int | float):
+                slogger.glob.error(
+                    f"Points must be type of "
+                    f"`tuple[int | float] | list[int | float] | LazyList`, "
+                    f"not `{points.__class__.__name__}[{point.__class__.__name__}]`"
+                    "Please, update import code to return the correct type."
+                )
+                shape["points"] = tuple(map(float, points))
+                return
 
     def _call_callback(self):
         if self._len() > self._MAX_ANNO_SIZE:
@@ -648,7 +748,7 @@ class CommonData(InstanceLabelData):
 
 class JobData(CommonData):
     META_FIELD = "job"
-    def __init__(self, annotation_ir, db_job, **kwargs):
+    def __init__(self, annotation_ir: AnnotationIR, db_job: Job, **kwargs):
         self._db_job = db_job
         self._db_task = db_job.segment.task
 
@@ -708,18 +808,18 @@ class JobData(CommonData):
                 if self.abs_frame_id(frame) not in frame_set
             )
 
+            if self.db_instance.type == JobType.GROUND_TRUTH:
+                self._excluded_frames.update(self.db_data.validation_layout.disabled_frames)
+
         if self._required_frames:
-            abs_range = self.abs_range
-            self._required_frames = set(
-                self.abs_frame_id(frame) for frame in self._required_frames
-                if frame in abs_range
-            )
+            rel_range = self.rel_range
+            self._required_frames = set(frame for frame in self._required_frames if frame in rel_range)
 
     def __len__(self):
         segment = self._db_job.segment
         return segment.stop_frame - segment.start_frame + 1
 
-    def _get_queryset(self):
+    def _get_db_images(self):
         return (image for image in self._db_data.images.all() if image.frame in self.abs_range)
 
     @property
@@ -743,7 +843,7 @@ class JobData(CommonData):
     @property
     def stop(self) -> int:
         segment = self._db_job.segment
-        return segment.stop_frame + 1
+        return segment.stop_frame
 
     @property
     def db_instance(self):
@@ -752,7 +852,7 @@ class JobData(CommonData):
 
 class TaskData(CommonData):
     META_FIELD = "task"
-    def __init__(self, annotation_ir, db_task, **kwargs):
+    def __init__(self, annotation_ir: AnnotationIR, db_task: Task, **kwargs):
         self._db_task = db_task
         super().__init__(annotation_ir, db_task, **kwargs)
 
@@ -828,8 +928,30 @@ class TaskData(CommonData):
     def db_instance(self):
         return self._db_task
 
-    def _get_queryset(self):
+    def _get_db_images(self):
         return self._db_data.images.all()
+
+    def _init_frame_info(self):
+        super()._init_frame_info()
+
+        if self.db_data.validation_mode == models.ValidationMode.GT_POOL:
+            # For GT pool-enabled tasks, we:
+            # - skip validation frames in normal jobs on annotation export
+            # - load annotations for GT pool frames on annotation import
+
+            assert not hasattr(self.db_data, 'video')
+
+            for db_image in self._get_db_images():
+                # We should not include placeholder frames in task export, so we exclude them
+                if db_image.is_placeholder:
+                    self._excluded_frames.add(db_image.frame)
+                    continue
+
+                # We should not match placeholder frames during task import,
+                # so we update the frame matching index
+                self._frame_mapping[self._get_filename(db_image.path)] = (
+                    self.rel_frame_id(db_image.frame)
+                )
 
 class ProjectData(InstanceLabelData):
     META_FIELD = 'project'
@@ -1128,7 +1250,7 @@ class ProjectData(InstanceLabelData):
                 for i, element in enumerate(track.get("elements", []))]
         )
 
-    def group_by_frame(self, include_empty=False):
+    def group_by_frame(self, include_empty: bool = False):
         frames: Dict[Tuple[str, int], ProjectData.Frame] = {}
         def get_frame(task_id: int, idx: int) -> ProjectData.Frame:
             frame_info = self._frame_info[(task_id, idx)]
@@ -1154,10 +1276,12 @@ class ProjectData(InstanceLabelData):
                     get_frame(*ident)
 
         for task in self._db_tasks.values():
-            anno_manager = AnnotationManager(self._annotation_irs[task.id])
+            anno_manager = AnnotationManager(
+                self._annotation_irs[task.id], dimension=self._annotation_irs[task.id].dimension
+            )
             for shape in sorted(
                 anno_manager.to_shapes(
-                    task.data.size, self._annotation_irs[task.id].dimension,
+                    task.data.size,
                     include_outside=False,
                     use_server_track_ids=self._use_server_track_ids
                 ),
@@ -1313,7 +1437,7 @@ class ProjectData(InstanceLabelData):
 
 @attrs(frozen=True, auto_attribs=True)
 class ImageSource:
-    db_data: Data
+    db_task: Task
     is_video: bool = attrib(kw_only=True)
 
 class ImageProvider:
@@ -1342,8 +1466,10 @@ class ImageProvider2D(ImageProvider):
                 # optimization for videos: use numpy arrays instead of bytes
                 # some formats or transforms can require image data
                 return self._frame_provider.get_frame(frame_index,
-                    quality=FrameProvider.Quality.ORIGINAL,
-                    out_type=FrameProvider.Type.NUMPY_ARRAY)[0]
+                    quality=FrameQuality.ORIGINAL,
+                    out_type=FrameOutputType.NUMPY_ARRAY
+                ).data
+
             return dm.Image(data=video_frame_loader, **image_kwargs)
         else:
             def image_loader(_):
@@ -1351,8 +1477,10 @@ class ImageProvider2D(ImageProvider):
 
                 # for images use encoded data to avoid recoding
                 return self._frame_provider.get_frame(frame_index,
-                    quality=FrameProvider.Quality.ORIGINAL,
-                    out_type=FrameProvider.Type.BUFFER)[0].getvalue()
+                    quality=FrameQuality.ORIGINAL,
+                    out_type=FrameOutputType.BUFFER
+                ).data.getvalue()
+
             return dm.ByteImage(data=image_loader, **image_kwargs)
 
     def _load_source(self, source_id: int, source: ImageSource) -> None:
@@ -1360,7 +1488,7 @@ class ImageProvider2D(ImageProvider):
             return
 
         self._unload_source()
-        self._frame_provider = FrameProvider(source.db_data)
+        self._frame_provider = TaskFrameProvider(source.db_task)
         self._current_source_id = source_id
 
     def _unload_source(self) -> None:
@@ -1376,7 +1504,7 @@ class ImageProvider3D(ImageProvider):
         self._images_per_source = {
             source_id: {
                 image.id: image
-                for image in source.db_data.images.prefetch_related('related_files')
+                for image in source.db_task.data.images.prefetch_related('related_files')
             }
             for source_id, source in sources.items()
         }
@@ -1385,7 +1513,7 @@ class ImageProvider3D(ImageProvider):
         source = self._sources[source_id]
 
         point_cloud_path = osp.join(
-            source.db_data.get_upload_dirname(), image_kwargs['path'],
+            source.db_task.data.get_upload_dirname(), image_kwargs['path'],
         )
 
         image = self._images_per_source[source_id][frame_id]
@@ -1481,12 +1609,14 @@ class CvatTaskOrJobDataExtractor(dm.SourceExtractor, CVATDataExtractorMixin):
         dimension: DimensionType = DimensionType.DIM_2D,
         **kwargs
     ):
+        instance_meta = instance_data.meta[instance_data.META_FIELD]
         dm.SourceExtractor.__init__(
-            self, media_type=dm.Image if dimension == DimensionType.DIM_2D else PointCloud
+            self,
+            media_type=dm.Image if dimension == DimensionType.DIM_2D else PointCloud,
+            subset=instance_meta['subset'],
         )
         CVATDataExtractorMixin.__init__(self, **kwargs)
 
-        instance_meta = instance_data.meta[instance_data.META_FIELD]
         self._categories = self._load_categories(instance_meta['labels'])
         self._user = self._load_user_info(instance_meta) if dimension == DimensionType.DIM_3D else {}
         self._dimension = dimension
@@ -1496,11 +1626,18 @@ class CvatTaskOrJobDataExtractor(dm.SourceExtractor, CVATDataExtractorMixin):
         is_video = instance_meta['mode'] == 'interpolation'
         ext = ''
         if is_video:
-            ext = FrameProvider.VIDEO_FRAME_EXT
+            ext = TaskFrameProvider.VIDEO_FRAME_EXT
 
         if dimension == DimensionType.DIM_3D or include_images:
+            if isinstance(instance_data, TaskData):
+                db_task = instance_data.db_instance
+            elif isinstance(instance_data, JobData):
+                db_task = instance_data.db_instance.segment.task
+            else:
+                assert False
+
             self._image_provider = IMAGE_PROVIDERS_BY_DIMENSION[dimension](
-                {0: ImageSource(instance_data.db_data, is_video=is_video)}
+                {0: ImageSource(db_task, is_video=is_video)}
             )
 
         for frame_data in instance_data.group_by_frame(include_empty=True):
@@ -1521,6 +1658,7 @@ class CvatTaskOrJobDataExtractor(dm.SourceExtractor, CVATDataExtractorMixin):
                 dm_item = dm.DatasetItem(
                         id=osp.splitext(frame_data.name)[0],
                         annotations=dm_anno, media=dm_image,
+                        subset=frame_data.subset,
                         attributes={'frame': frame_data.frame
                     })
             elif dimension == DimensionType.DIM_3D:
@@ -1537,7 +1675,7 @@ class CvatTaskOrJobDataExtractor(dm.SourceExtractor, CVATDataExtractorMixin):
                 dm_item = dm.DatasetItem(
                     id=osp.splitext(osp.split(frame_data.name)[-1])[0],
                     annotations=dm_anno, media=PointCloud(dm_image[0]), related_images=dm_image[1],
-                    attributes=attributes
+                    attributes=attributes, subset=frame_data.subset,
                 )
 
             dm_items.append(dm_item)
@@ -1581,13 +1719,13 @@ class CVATProjectDataExtractor(dm.Extractor, CVATDataExtractorMixin):
         if self._dimension == DimensionType.DIM_3D or include_images:
             self._image_provider = IMAGE_PROVIDERS_BY_DIMENSION[self._dimension](
                 {
-                    task.id: ImageSource(task.data, is_video=task.mode == 'interpolation')
+                    task.id: ImageSource(task, is_video=task.mode == 'interpolation')
                     for task in project_data.tasks
                 }
             )
 
         ext_per_task: Dict[int, str] = {
-            task.id: FrameProvider.VIDEO_FRAME_EXT if is_video else ''
+            task.id: TaskFrameProvider.VIDEO_FRAME_EXT if is_video else ''
             for task in project_data.tasks
             for is_video in [task.mode == 'interpolation']
         }
@@ -1662,6 +1800,33 @@ def GetCVATDataExtractor(
 
 class CvatImportError(Exception):
     pass
+
+@attrs
+class CvatDatasetNotFoundError(CvatImportError):
+    message: str = ""
+    reason: str = ""
+    format_name: str = ""
+    _docs_base_url = f"{settings.CVAT_DOCS_URL}/manual/advanced/formats/"
+
+    def __str__(self) -> str:
+        formatted_format_name = self._format_name_for_docs()
+        docs_message = self._docs_message(formatted_format_name)
+        display_message = self._clean_display_message()
+        return f"{docs_message}. {display_message}"
+
+    def _format_name_for_docs(self) -> str:
+        return self.format_name.replace("_", "-")
+
+    def _docs_message(self, formatted_format_name: str) -> str:
+        return f"Check [format docs]({self._docs_base_url}format-{formatted_format_name})"
+
+    def _clean_display_message(self) -> str:
+        message = re.sub(r'^.*?:', "", self.message)
+        if "dataset must contain a file matching pattern" in message:
+            message = message.replace("dataset must contain a file matching pattern", "")
+            message = message.replace("\n", "")
+            message = "Dataset must contain a file:" + message
+        return re.sub(r' +', " ", message)
 
 def mangle_image_name(name: str, subset: str, names: DefaultDict[Tuple[str, str], int]) -> str:
     name, ext = name.rsplit(osp.extsep, maxsplit=1)
@@ -1782,7 +1947,7 @@ class CvatToDmAnnotationConverter:
                 "attributes": dm_attr,
             }), self.cvat_frame_anno.height, self.cvat_frame_anno.width)
         elif shape.type == ShapeType.MASK:
-            anno = CVATRleToCOCORle.convert_mask(SimpleNamespace(**{
+            anno = MaskConverter.cvat_rle_to_dm_rle(SimpleNamespace(**{
                 "points": shape.points,
                 "label": dm_label,
                 "z_order": shape.z_order,
@@ -1953,7 +2118,8 @@ def import_dm_annotations(dm_dataset: dm.Dataset, instance_data: Union[ProjectDa
         'sly_pointcloud',
         'coco',
         'coco_instances',
-        'coco_person_keypoints'
+        'coco_person_keypoints',
+        'voc'
     ]
 
     label_cat = dm_dataset.categories()[dm.AnnotationType.label]
@@ -2005,35 +2171,20 @@ def import_dm_annotations(dm_dataset: dm.Dataset, instance_data: Union[ProjectDa
                 if ann.type in shapes:
                     points = []
                     if ann.type == dm.AnnotationType.cuboid_3d:
-                        points = [*ann.position, *ann.rotation, *ann.scale, 0, 0, 0, 0, 0, 0, 0]
+                        points = (*ann.position, *ann.rotation, *ann.scale, 0, 0, 0, 0, 0, 0, 0)
                     elif ann.type == dm.AnnotationType.mask:
-                        istrue = np.argwhere(ann.image == 1).transpose()
-                        top = int(istrue[0].min())
-                        left = int(istrue[1].min())
-                        bottom = int(istrue[0].max())
-                        right = int(istrue[1].max())
-                        points = ann.image[top:bottom + 1, left:right + 1]
-
-                        def reduce_fn(acc, v):
-                            if v == acc['val']:
-                                acc['res'][-1] += 1
-                            else:
-                                acc['val'] = v
-                                acc['res'].append(1)
-                            return acc
-                        points = reduce(reduce_fn, points.reshape(np.prod(points.shape)), { 'res': [0], 'val': False })['res']
-                        points.extend([int(left), int(top), int(right), int(bottom)])
+                        points = tuple(MaskConverter.dm_mask_to_cvat_rle(ann))
                     elif ann.type != dm.AnnotationType.skeleton:
-                        points = ann.points
+                        points = tuple(ann.points)
 
                     rotation = ann.attributes.pop('rotation', 0.0)
                     # Use safe casting to bool instead of plain reading
                     # because in some formats return type can be different
                     # from bool / None
                     # https://github.com/openvinotoolkit/datumaro/issues/719
-                    occluded = dm.util.cast(ann.attributes.pop('occluded', None), bool) is True
-                    keyframe = dm.util.cast(ann.attributes.get('keyframe', None), bool) is True
-                    outside = dm.util.cast(ann.attributes.pop('outside', None), bool) is True
+                    occluded = dm.util.cast(ann.attributes.pop('occluded', None), to_bool) is True
+                    keyframe = dm.util.cast(ann.attributes.get('keyframe', None), to_bool) is True
+                    outside = dm.util.cast(ann.attributes.pop('outside', None), to_bool) is True
 
                     track_id = ann.attributes.pop('track_id', None)
                     source = ann.attributes.pop('source').lower() \
@@ -2080,7 +2231,7 @@ def import_dm_annotations(dm_dataset: dm.Dataset, instance_data: Union[ProjectDa
                         ))
                         continue
 
-                    if keyframe or outside:
+                    if dm_dataset.format in track_formats:
                         if track_id not in tracks:
                             tracks[track_id] = {
                                 'label': label_cat.items[ann.label].name,
@@ -2107,11 +2258,8 @@ def import_dm_annotations(dm_dataset: dm.Dataset, instance_data: Union[ProjectDa
 
                         if ann.type == dm.AnnotationType.skeleton:
                             for element in ann.elements:
-                                element_keyframe = dm.util.cast(element.attributes.get('keyframe', None), bool, True)
                                 element_occluded = element.visibility[0] == dm.Points.Visibility.hidden
                                 element_outside = element.visibility[0] == dm.Points.Visibility.absent
-                                if not element_keyframe and not element_outside:
-                                    continue
 
                                 if element.label not in tracks[track_id]['elements']:
                                     tracks[track_id]['elements'][element.label] = instance_data.Track(
@@ -2120,6 +2268,7 @@ def import_dm_annotations(dm_dataset: dm.Dataset, instance_data: Union[ProjectDa
                                         source=source,
                                         shapes=[],
                                     )
+
                                 element_attributes = [
                                     instance_data.Attribute(name=n, value=str(v))
                                     for n, v in element.attributes.items()
@@ -2151,10 +2300,54 @@ def import_dm_annotations(dm_dataset: dm.Dataset, instance_data: Union[ProjectDa
                 raise CvatImportError("Image {}: can't import annotation "
                     "#{} ({}): {}".format(item.id, idx, ann.type.name, e)) from e
 
-    for track in tracks.values():
-        track['elements'] = list(track['elements'].values())
-        instance_data.add_track(instance_data.Track(**track))
+    def _validate_track_shapes(shapes):
+        shapes = sorted(shapes, key=lambda t: t.frame)
+        new_shapes = []
+        prev_shape = None
+        # infer the keyframe shapes and keep only them
+        for shape in shapes:
+            prev_is_visible = prev_shape and not prev_shape.outside
+            cur_is_visible = shape and not shape.outside
 
+            has_gap = False
+            if prev_is_visible:
+                has_gap = prev_shape.frame + instance_data.frame_step < shape.frame
+
+            if has_gap:
+                prev_shape = prev_shape._replace(outside=True, keyframe=True,
+                    frame=prev_shape.frame + instance_data.frame_step)
+                new_shapes.append(prev_shape)
+
+            if prev_is_visible != cur_is_visible or cur_is_visible and (has_gap or shape.keyframe):
+                shape = shape._replace(keyframe=True)
+                new_shapes.append(shape)
+
+            prev_shape = shape
+
+        if prev_shape and not prev_shape.outside and (
+            prev_shape.frame + instance_data.frame_step <= stop_frame
+            # has a gap before the current instance segment end
+        ):
+            prev_shape = prev_shape._replace(outside=True, keyframe=True,
+                frame=prev_shape.frame + instance_data.frame_step)
+            new_shapes.append(prev_shape)
+
+        return new_shapes
+
+    stop_frame = int(instance_data.meta[instance_data.META_FIELD]['stop_frame'])
+    for track_id, track in tracks.items():
+        track['shapes'] = _validate_track_shapes(track['shapes'])
+
+        if ann.type == dm.AnnotationType.skeleton:
+            new_elements = {}
+            for element_id, element in track['elements'].items():
+                new_element_shapes = _validate_track_shapes(element.shapes)
+                new_elements[element_id] = element._replace(shapes=new_element_shapes)
+            track['elements'] = new_elements
+
+        if track['shapes'] or track['elements']:
+            track['elements'] = list(track['elements'].values())
+            instance_data.add_track(instance_data.Track(**track))
 
 def import_labels_to_project(project_annotation, dataset: dm.Dataset):
     labels = []
@@ -2181,8 +2374,8 @@ def load_dataset_data(project_annotation, dataset: dm.Dataset, project_data):
                 raise CvatImportError(f'Target project does not have label with name "{label.name}"')
     for subset_id, subset in enumerate(dataset.subsets().values()):
         job = rq.get_current_job()
-        job.meta['status'] = 'Task from dataset is being created...'
-        job.meta['progress'] = (subset_id + job.meta.get('task_progress', 0.)) / len(dataset.subsets().keys())
+        job.meta[RQJobMetaField.STATUS] = 'Task from dataset is being created...'
+        job.meta[RQJobMetaField.PROGRESS] = (subset_id + job.meta.get(RQJobMetaField.TASK_PROGRESS, 0.)) / len(dataset.subsets().keys())
         job.save_meta()
 
         task_fields = {
@@ -2221,3 +2414,19 @@ def load_dataset_data(project_annotation, dataset: dm.Dataset, project_data):
             dataset_files['data_root'] = osp.commonpath(root_paths) + osp.sep
 
         project_annotation.add_task(task_fields, dataset_files, project_data)
+
+def detect_dataset(dataset_dir: str, format_name: str, importer: Importer) -> None:
+    not_found_error_instance = CvatDatasetNotFoundError()
+
+    def not_found_error(_, reason, human_message):
+        not_found_error_instance.format_name = format_name
+        not_found_error_instance.reason = reason
+        not_found_error_instance.message = human_message
+
+    detection_env = Environment()
+    detection_env.importers.items.clear()
+    detection_env.importers.register(format_name, importer)
+    detected = detection_env.detect_dataset(dataset_dir, depth=4, rejection_callback=not_found_error)
+
+    if not detected and not_found_error_instance.reason != RejectionReason.detection_unsupported:
+        raise not_found_error_instance
