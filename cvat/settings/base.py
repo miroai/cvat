@@ -93,7 +93,6 @@ INSTALLED_APPS = [
     'compressor',
     'django_sendfile',
     "dj_rest_auth",
-    'dj_rest_auth.registration',
     'dj_pagination',
     'django_filters',
     'rest_framework',
@@ -238,9 +237,12 @@ IAM_BASE_EXCEPTION = None # a class which will be used by IAM to report errors
 IAM_DEFAULT_ROLE = 'user'
 
 IAM_ADMIN_ROLE = 'admin'
+IAM_REGISTRATION_ENABLED = to_bool(os.getenv('IAM_REGISTRATION_ENABLED', False))
+if IAM_REGISTRATION_ENABLED:
+    INSTALLED_APPS.append('dj_rest_auth.registration')
 # Index in the list below corresponds to the priority (0 has highest priority)
 IAM_ROLES = [IAM_ADMIN_ROLE, 'user', 'worker']
-IAM_OPA_HOST = 'http://opa:8181'
+IAM_OPA_HOST = os.getenv('IAM_OPA_HOST', 'http://opa:8181')
 IAM_OPA_DATA_URL = f'{IAM_OPA_HOST}/v1/data'
 LOGIN_URL = 'rest_login'
 LOGIN_REDIRECT_URL = '/'
@@ -699,6 +701,7 @@ ACCOUNT_ADAPTER = 'cvat.apps.iam.adapters.DefaultAccountAdapterEx'
 
 CVAT_HOST = os.getenv('CVAT_HOST', 'localhost')
 CVAT_BASE_URL = os.getenv('CVAT_BASE_URL', f'http://{CVAT_HOST}:8080').rstrip('/')
+CSRF_TRUSTED_ORIGINS = [CVAT_BASE_URL]
 
 CLICKHOUSE = {
     'events': {
