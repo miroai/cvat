@@ -1,7 +1,8 @@
 # Copyright (C) 2020-2022 Intel Corporation
-# Copyright (C) 2023-2024 CVAT.ai Corporation
+# Copyright (C) CVAT.ai Corporation
 #
 # SPDX-License-Identifier: MIT
+
 
 import copy
 import io
@@ -30,15 +31,19 @@ import numpy as np
 from django.conf import settings
 from django.contrib.auth.models import Group, User
 from django.http import HttpResponse
+from django.test import override_settings
 from pdf2image import convert_from_bytes
 from PIL import Image
 from pycocotools import coco as coco_loader
 from pyunpack import Archive
 from rest_framework import status
 from rest_framework.test import APIClient
+from rq.job import Job as RQJob
+from rq.queue import Queue as RQQueue
 
 from cvat.apps.dataset_manager.tests.utils import TestDir
 from cvat.apps.dataset_manager.util import current_function_name
+from cvat.apps.engine.cloud_provider import AWS_S3, Status
 from cvat.apps.engine.media_extractors import ValidateDimension, sort
 from cvat.apps.engine.models import (
     AttributeSpec,
@@ -1314,6 +1319,7 @@ class ProjectListOfTasksAPITestCase(ApiTestBase):
         response = self._run_api_v2_projects_id_tasks(None, project.id)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+
 class ProjectBackupAPITestCase(ApiTestBase):
     @classmethod
     def setUpTestData(cls):
@@ -1630,6 +1636,12 @@ class ProjectBackupAPITestCase(ApiTestBase):
 
         return response.data
 
+    def _get_tasks_for_project(self, user, pid):
+        with ForceLogin(user, self.client):
+            response = self.client.get('/api/tasks?project_id={}'.format(pid))
+
+        return sorted(response.data["results"], key=lambda task: task["name"])
+
     def _run_api_v2_projects_id_export_import(self, user):
         for project in self.projects:
             if user:
@@ -1666,7 +1678,7 @@ class ProjectBackupAPITestCase(ApiTestBase):
                 }
                 response = self._run_api_v2_projects_import(user, uploaded_data)
                 self.assertEqual(response.status_code, HTTP_202_ACCEPTED)
-                if response.status_code == status.HTTP_200_OK:
+                if response.status_code == status.HTTP_202_ACCEPTED:
                     rq_id = response.data["rq_id"]
                     response = self._run_api_v2_projects_import(user, {"rq_id": rq_id})
                     self.assertEqual(response.status_code, HTTP_201_CREATED)
@@ -1688,6 +1700,26 @@ class ProjectBackupAPITestCase(ApiTestBase):
                             "tasks",
                         ),
                     )
+                    self.assertEqual(original_project["tasks"]["count"], imported_project["tasks"]["count"])
+                    original_tasks = self._get_tasks_for_project(user, original_project["id"])
+                    imported_tasks = self._get_tasks_for_project(user, imported_project["id"])
+                    for original_task, imported_task in zip(original_tasks, imported_tasks):
+                        compare_objects(
+                            self=self,
+                            obj1=original_task,
+                            obj2=imported_task,
+                            ignore_keys=(
+                                "id",
+                                "url",
+                                "created_date",
+                                "updated_date",
+                                "username",
+                                "project_id",
+                                "data",
+                                # backup does not store overlap explicitly
+                                "overlap",
+                            ),
+                        )
 
     def test_api_v2_projects_id_export_admin(self):
         self._run_api_v2_projects_id_export_import(self.admin)
@@ -1700,6 +1732,116 @@ class ProjectBackupAPITestCase(ApiTestBase):
 
     def test_api_v2_projects_id_export_no_auth(self):
         self._run_api_v2_projects_id_export_import(None)
+
+
+@override_settings(MEDIA_CACHE_ALLOW_STATIC_CACHE=False)
+class ProjectCloudBackupAPINoStaticChunksTestCase(ProjectBackupAPITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        create_db_users(cls)
+        cls.client = APIClient()
+        cls._create_cloud_storage()
+        cls._create_media()
+        cls._create_projects()
+
+    @classmethod
+    def _create_cloud_storage(cls):
+        data = {
+            "provider_type": "AWS_S3_BUCKET",
+            "resource": "test",
+            "display_name": "Bucket",
+            "credentials_type": "KEY_SECRET_KEY_PAIR",
+            "key": "minio_access_key",
+            "secret_key": "minio_secret_key",
+            "specific_attributes": "endpoint_url=http://minio:9000",
+            "description": "Some description",
+            "manifests": [],
+        }
+
+        class MockAWS(AWS_S3):
+            _files = {}
+
+            def get_status(self):
+                return Status.AVAILABLE
+
+            @classmethod
+            def create_file(cls, key, _bytes):
+                cls._files[key] = _bytes
+
+            def get_file_status(self, key):
+                return Status.AVAILABLE if key in self._files else Status.NOT_FOUND
+
+            def _download_range_of_bytes(self, key, stop_byte, start_byte):
+                return self._files[key][start_byte:stop_byte]
+
+            def _download_fileobj_to_stream(self, key, stream):
+                stream.write(self._files[key])
+
+        cls.mock_aws = MockAWS
+
+        cls.aws_patch = mock.patch("cvat.apps.engine.cloud_provider.AWS_S3", MockAWS)
+        cls.aws_patch.start()
+
+        with ForceLogin(cls.owner, cls.client):
+            response = cls.client.post('/api/cloudstorages', data=data, format="json")
+            assert response.status_code == status.HTTP_201_CREATED, (response.status_code, response.content)
+            cls.cloud_storage_id = response.json()["id"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.aws_patch.stop()
+        super().tearDownClass()
+
+    @classmethod
+    def _create_media(cls):
+        cls.media_data = []
+        cls.media = {'files': [], 'dirs': []}
+        for file in [
+            generate_random_image_file("test_1.jpg")[1],
+            generate_random_image_file("test_2.jpg")[1],
+            generate_pdf_file("test_pdf_1.pdf", 7)[1],
+            generate_zip_archive_file("test_archive_1.zip", 10)[1],
+            generate_video_file("test_video.mp4")[1],
+        ]:
+            cls.mock_aws.create_file(file.name, file.getvalue())
+
+        cls.media_data.extend([
+            # image list cloud
+            {
+                "server_files[0]": "test_1.jpg",
+                "server_files[1]": "test_2.jpg",
+                "image_quality": 75,
+                "cloud_storage_id": cls.cloud_storage_id,
+                "storage": StorageChoice.CLOUD_STORAGE,
+            },
+            # video cloud
+            {
+                "server_files[0]": "test_video.mp4",
+                "image_quality": 75,
+                "cloud_storage_id": cls.cloud_storage_id,
+                "storage": StorageChoice.CLOUD_STORAGE,
+            },
+            # zip archive cloud
+            {
+                "server_files[0]": "test_archive_1.zip",
+                "image_quality": 50,
+                "cloud_storage_id": cls.cloud_storage_id,
+                "storage": StorageChoice.CLOUD_STORAGE,
+            },
+            # pdf cloud
+            {
+                "server_files[0]": "test_pdf_1.pdf",
+                "image_quality": 54,
+                "cloud_storage_id": cls.cloud_storage_id,
+                "storage": StorageChoice.CLOUD_STORAGE,
+            },
+        ])
+
+
+@override_settings(MEDIA_CACHE_ALLOW_STATIC_CACHE=True)
+class ProjectCloudBackupAPIStaticChunksTestCase(ProjectCloudBackupAPINoStaticChunksTestCase):
+    pass
+
 
 class ProjectExportAPITestCase(ApiTestBase):
     @classmethod
@@ -3105,30 +3247,47 @@ class TaskImportExportAPITestCase(ApiTestBase):
         self._run_api_v2_tasks_id_export_import(None)
 
     def test_can_remove_export_cache_automatically_after_successful_export(self):
+        from cvat.apps.dataset_manager.cron import (
+            cleanup_export_cache_directory,
+            clear_export_cache,
+        )
         self._create_tasks()
         task_id = self.tasks[0]["id"]
         user = self.admin
 
-        with mock.patch('cvat.apps.dataset_manager.views.TASK_CACHE_TTL', new=timedelta(hours=10)):
+        TASK_CACHE_TTL = timedelta(hours=1)
+        with (
+            mock.patch('cvat.apps.dataset_manager.views.TASK_CACHE_TTL', new=TASK_CACHE_TTL),
+            mock.patch('cvat.apps.dataset_manager.views.TTL_CONSTS', new={'task': TASK_CACHE_TTL}),
+            mock.patch(
+                "cvat.apps.dataset_manager.cron.clear_export_cache",
+                side_effect=clear_export_cache,
+            ) as mock_clear_export_cache,
+        ):
+            cleanup_export_cache_directory()
+            mock_clear_export_cache.assert_not_called()
+
             response = self._run_api_v2_tasks_id_export(task_id, user)
             self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
             response = self._run_api_v2_tasks_id_export(task_id, user)
             self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
-        scheduler = django_rq.get_scheduler(settings.CVAT_QUEUES.IMPORT_DATA.value)
-        scheduled_jobs = list(scheduler.get_jobs())
-        cleanup_job = next(
-            j for j in scheduled_jobs if j.func_name.endswith('.engine.backup._clear_export_cache')
-        )
+            queue: RQQueue = django_rq.get_queue(settings.CVAT_QUEUES.EXPORT_DATA.value)
+            rq_job_ids = queue.finished_job_registry.get_job_ids()
+            self.assertEqual(len(rq_job_ids), 1)
+            job: RQJob | None = queue.fetch_job(rq_job_ids[0])
+            self.assertFalse(job is None)
+            file_path = job.return_value()
+            self.assertTrue(os.path.isfile(file_path))
 
-        export_path = cleanup_job.kwargs['file_path']
-        self.assertTrue(os.path.isfile(export_path))
-
-        from cvat.apps.engine.backup import _clear_export_cache
-        _clear_export_cache(**cleanup_job.kwargs)
-
-        self.assertFalse(os.path.isfile(export_path))
+            with (
+                mock.patch('cvat.apps.dataset_manager.views.TASK_CACHE_TTL', new=timedelta(seconds=0)),
+                mock.patch('cvat.apps.dataset_manager.views.TTL_CONSTS', new={'task': timedelta(seconds=0)}),
+            ):
+                cleanup_export_cache_directory()
+                mock_clear_export_cache.assert_called_once()
+            self.assertFalse(os.path.exists(file_path))
 
 
 def generate_random_image_file(filename):
