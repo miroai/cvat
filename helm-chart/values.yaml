@@ -8,6 +8,9 @@ nameOverride: ""
 fullnameOverride: ""
 
 cvat:
+  ingress:
+    annotations: {}
+
   backend:
     labels: {}
     annotations: {}
@@ -143,6 +146,9 @@ cvat:
     imagePullPolicy: Always
     permissionFix:
       enabled: true
+      # commandOverride: []
+      paths:
+        - /home/django
     service:
       annotations: {}
       spec:
@@ -371,6 +377,8 @@ nuclio:
 analytics:
   # Set clickhouse.enabled to false if you disable analytics or use an external database
   enabled: true
+  ingress:
+    annotations: {}
   clickhouseDb: cvat
   clickhouseUser: user
   clickhousePassword: user
