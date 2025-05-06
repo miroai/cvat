@@ -8,6 +8,9 @@ nameOverride: ""
 fullnameOverride: ""
 
 cvat:
+  ingress:
+    annotations: {}
+
   backend:
     labels: {}
     annotations: {}
@@ -145,10 +148,13 @@ cvat:
         extraArgs: []
     replicas: 1
     image: cvat/server
-    tag: v2.35.0
+    tag: v2.35.0-miroai
     imagePullPolicy: Always
     permissionFix:
       enabled: true
+      # commandOverride: []
+      paths:
+        - /home/django
     service:
       annotations: {}
       spec:
@@ -167,7 +173,7 @@ cvat:
   frontend:
     replicas: 1
     image: cvat/ui
-    tag: v2.35.0
+    tag: v2.35.0-miroai
     imagePullPolicy: Always
     labels: {}
     #  test: test
@@ -377,6 +383,8 @@ nuclio:
 analytics:
   # Set clickhouse.enabled to false if you disable analytics or use an external database
   enabled: true
+  ingress:
+    annotations: {}
   clickhouseDb: cvat
   clickhouseUser: user
   clickhousePassword: user
