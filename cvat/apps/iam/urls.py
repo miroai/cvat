@@ -45,7 +45,7 @@ if settings.IAM_TYPE == "BASIC":
     ]
     if settings.IAM_REGISTRATION_ENABLED:
         urlpatterns.append(
-            path('register', RegisterViewEx.as_view(), name=BASIC_REGISTER_PATH_NAME)
+            path("register", RegisterViewEx.as_view(), name=BASIC_REGISTER_PATH_NAME)
         )
     if allauth_settings.EMAIL_VERIFICATION != allauth_settings.EmailVerificationMethod.NONE:
         # emails

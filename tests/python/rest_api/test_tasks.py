@@ -70,7 +70,6 @@ from .utils import (
     compare_annotations,
     create_task,
     export_dataset,
-    export_task_backup,
     export_task_dataset,
     parse_frame_step,
     unique,
@@ -743,11 +742,10 @@ class TestGetTaskDataset:
         username: str,
         task_id: int,
         *,
-        api_version: Union[int, tuple[int]],
         local_download: bool = True,
         **kwargs,
     ) -> Optional[bytes]:
-        dataset = export_task_dataset(username, api_version, save_images=True, id=task_id, **kwargs)
+        dataset = export_task_dataset(username, save_images=True, id=task_id, **kwargs)
         if local_download:
             assert zipfile.is_zipfile(io.BytesIO(dataset))
         else:
@@ -755,50 +753,28 @@ class TestGetTaskDataset:
 
         return dataset
 
-    @pytest.mark.usefixtures("restore_db_per_function")
-    @pytest.mark.parametrize("api_version", product((1, 2), repeat=2))
-    @pytest.mark.parametrize(
-        "local_download", (True, pytest.param(False, marks=pytest.mark.with_external_services))
-    )
-    def test_can_export_task_dataset_locally_and_to_cloud_with_both_api_versions(
-        self,
-        admin_user,
-        tasks_with_shapes,
-        filter_tasks,
-        api_version: tuple[int],
-        local_download: bool,
-    ):
-        filter_ = "target_storage__location"
-        if local_download:
-            filter_ = "exclude_" + filter_
-        filtered_ids = {t["id"] for t in filter_tasks(**{filter_: "cloud_storage"})}
-
-        task_id = next(iter(filtered_ids & {t["id"] for t in tasks_with_shapes}))
-        self._test_can_export_dataset(
-            admin_user,
-            task_id,
-            api_version=api_version,
-            local_download=local_download,
-        )
-
-    @pytest.mark.parametrize("api_version", (1, 2))
     @pytest.mark.parametrize("tid", [21])
     @pytest.mark.parametrize(
         "format_name", ["CVAT for images 1.1", "CVAT for video 1.1", "COCO Keypoints 1.0"]
     )
     def test_can_export_task_with_several_jobs(
-        self, admin_user, tid, format_name, api_version: int
+        self,
+        admin_user,
+        tid,
+        format_name,
     ):
         self._test_can_export_dataset(
             admin_user,
             tid,
             format=format_name,
-            api_version=api_version,
         )
 
-    @pytest.mark.parametrize("api_version", (1, 2))
     @pytest.mark.parametrize("tid", [8])
-    def test_can_export_task_to_coco_format(self, admin_user: str, tid: int, api_version: int):
+    def test_can_export_task_to_coco_format(
+        self,
+        admin_user: str,
+        tid: int,
+    ):
         # these annotations contains incorrect frame numbers
         # in order to check that server handle such cases
         annotations = {
@@ -887,7 +863,6 @@ class TestGetTaskDataset:
             admin_user,
             tid,
             format="COCO Keypoints 1.0",
-            api_version=api_version,
         )
 
         # check that server saved track annotations correctly
@@ -899,10 +874,12 @@ class TestGetTaskDataset:
         assert annotations["tracks"][0]["shapes"][0]["frame"] == 0
         assert annotations["tracks"][0]["elements"][0]["shapes"][0]["frame"] == 0
 
-    @pytest.mark.parametrize("api_version", (1, 2))
     @pytest.mark.usefixtures("restore_db_per_function")
     @pytest.mark.usefixtures("restore_redis_ondisk_per_function")
-    def test_can_download_task_with_special_chars_in_name(self, admin_user: str, api_version: int):
+    def test_can_download_task_with_special_chars_in_name(
+        self,
+        admin_user: str,
+    ):
         # Control characters in filenames may conflict with the Content-Disposition header
         # value restrictions, as it needs to include the downloaded file name.
 
@@ -918,13 +895,14 @@ class TestGetTaskDataset:
 
         task_id, _ = create_task(admin_user, task_spec, task_data)
 
-        dataset = self._test_can_export_dataset(admin_user, task_id, api_version=api_version)
+        dataset = self._test_can_export_dataset(admin_user, task_id)
         assert zipfile.is_zipfile(io.BytesIO(dataset))
 
     @pytest.mark.usefixtures("restore_db_per_function")
-    @pytest.mark.parametrize("api_version", (1, 2))
     def test_export_dataset_after_deleting_related_cloud_storage(
-        self, admin_user: str, tasks, api_version: int
+        self,
+        admin_user: str,
+        tasks,
     ):
         related_field = "target_storage"
 
@@ -941,7 +919,7 @@ class TestGetTaskDataset:
             result, response = api_client.tasks_api.retrieve(task_id)
             assert not result[related_field]
 
-            self._test_can_export_dataset(admin_user, task["id"], api_version=api_version)
+            self._test_can_export_dataset(admin_user, task["id"])
 
     @pytest.mark.parametrize(
         "export_format, default_subset_name, subset_path_template",
@@ -951,7 +929,6 @@ class TestGetTaskDataset:
             ("Ultralytics YOLO Detection 1.0", "train", "images/{subset}"),
         ],
     )
-    @pytest.mark.parametrize("api_version", (1, 2))
     def test_uses_subset_name(
         self,
         admin_user,
@@ -959,7 +936,6 @@ class TestGetTaskDataset:
         export_format,
         default_subset_name,
         subset_path_template,
-        api_version: int,
     ):
         tasks = filter_tasks(exclude_target_storage__location="cloud_storage")
         group_key_func = itemgetter("subset")
@@ -974,7 +950,6 @@ class TestGetTaskDataset:
             dataset = self._test_can_export_dataset(
                 admin_user,
                 task["id"],
-                api_version=api_version,
                 format=export_format,
             )
             with zipfile.ZipFile(io.BytesIO(dataset)) as zip_file:
@@ -997,7 +972,6 @@ class TestGetTaskDataset:
             dataset_file = io.BytesIO(
                 export_dataset(
                     api_client.tasks_api,
-                    api_version=2,
                     id=task["id"],
                     format=DATUMARO_FORMAT_FOR_DIMENSION[dimension],
                     save_images=False,
@@ -4114,23 +4088,6 @@ class TestTaskBackups:
         with make_sdk_client(self.user) as client:
             self.client = client
 
-    @pytest.mark.parametrize("api_version", product((1, 2), repeat=2))
-    @pytest.mark.parametrize(
-        "local_download", (True, pytest.param(False, marks=pytest.mark.with_external_services))
-    )
-    def test_can_export_backup_with_both_api_versions(
-        self, filter_tasks, api_version: tuple[int], local_download: bool
-    ):
-        task = filter_tasks(
-            **{("exclude_" if local_download else "") + "target_storage__location": "cloud_storage"}
-        )[0]
-        backup = export_task_backup(self.user, api_version, id=task["id"])
-
-        if local_download:
-            assert zipfile.is_zipfile(io.BytesIO(backup))
-        else:
-            assert backup is None
-
     def _test_can_export_backup(self, task_id: int):
         task = self.client.tasks.retrieve(task_id)
 
@@ -5648,7 +5605,6 @@ class TestImportTaskAnnotations:
             dataset_archive = io.BytesIO(
                 export_dataset(
                     api_client.tasks_api,
-                    api_version=2,
                     id=task["id"],
                     format=DATUMARO_FORMAT_FOR_DIMENSION[dimension],
                     save_images=False,
@@ -5672,36 +5628,38 @@ class TestImportTaskAnnotations:
 
         assert compare_annotations(original_annotations, updated_annotations) == {}
 
-    @pytest.mark.parametrize(
-        "format_name",
+    @parametrize(
+        "format_name, specific_info_included",
         [
-            "COCO 1.0",
-            "COCO Keypoints 1.0",
-            "CVAT 1.1",
-            "LabelMe 3.0",
-            "MOT 1.1",
-            "MOTS PNG 1.0",
-            "PASCAL VOC 1.1",
-            "Segmentation mask 1.1",
-            "YOLO 1.1",
-            "WiderFace 1.0",
-            "VGGFace2 1.0",
-            "Market-1501 1.0",
-            "Kitti Raw Format 1.0",
-            "Sly Point Cloud Format 1.0",
-            "KITTI 1.0",
-            "LFW 1.0",
-            "Cityscapes 1.0",
-            "Open Images V6 1.0",
-            "Datumaro 1.0",
-            "Datumaro 3D 1.0",
-            "Ultralytics YOLO Oriented Bounding Boxes 1.0",
-            "Ultralytics YOLO Detection 1.0",
-            "Ultralytics YOLO Pose 1.0",
-            "Ultralytics YOLO Segmentation 1.0",
+            ("COCO 1.0", None),
+            ("COCO Keypoints 1.0", None),
+            ("CVAT 1.1", True),
+            ("LabelMe 3.0", True),
+            ("MOT 1.1", True),
+            ("MOTS PNG 1.0", False),
+            pytest.param("PASCAL VOC 1.1", None, marks=pytest.mark.xfail),
+            ("Segmentation mask 1.1", True),
+            ("YOLO 1.1", True),
+            ("WiderFace 1.0", True),
+            ("VGGFace2 1.0", True),
+            ("Market-1501 1.0", False),
+            ("Kitti Raw Format 1.0", True),
+            ("Sly Point Cloud Format 1.0", False),
+            ("KITTI 1.0", False),
+            ("LFW 1.0", True),
+            ("Cityscapes 1.0", True),
+            ("Open Images V6 1.0", True),
+            ("Datumaro 1.0", True),
+            ("Datumaro 3D 1.0", True),
+            ("Ultralytics YOLO Oriented Bounding Boxes 1.0", True),
+            ("Ultralytics YOLO Detection 1.0", True),
+            ("Ultralytics YOLO Pose 1.0", True),
+            ("Ultralytics YOLO Segmentation 1.0", True),
         ],
     )
-    def test_check_import_error_on_wrong_file_structure(self, tasks_with_shapes, format_name):
+    def test_check_import_error_on_wrong_file_structure(
+        self, tasks_with_shapes: Iterable, format_name: str, specific_info_included: Optional[bool]
+    ):
         task_id = tasks_with_shapes[0]["id"]
 
         source_archive_path = self.tmp_dir / "incorrect_archive.zip"
@@ -5711,16 +5669,28 @@ class TestImportTaskAnnotations:
             with open(self.tmp_dir / file, "w") as f:
                 f.write("Some text")
 
-        zip_file = zipfile.ZipFile(source_archive_path, mode="a")
-        for path in incorrect_files:
-            zip_file.write(self.tmp_dir / path, path)
+        with zipfile.ZipFile(source_archive_path, mode="a") as zip_file:
+            for path in incorrect_files:
+                zip_file.write(self.tmp_dir / path, path)
+
         task = self.client.tasks.retrieve(task_id)
 
         with pytest.raises(exceptions.ApiException) as capture:
             task.import_annotations(format_name, source_archive_path)
 
-            assert b"Check [format docs]" in capture.value.body
-            assert b"Dataset must contain a file:" in capture.value.body
+        error_message = capture.value.body.decode()
+
+        if specific_info_included is None:
+            assert "Failed to find dataset" in error_message
+            return
+
+        assert "Check [format docs]" in error_message
+        expected_msg = (
+            "Dataset must contain a file:"
+            if specific_info_included
+            else "specific requirement information unavailable"
+        )
+        assert expected_msg in error_message
 
 
 @pytest.mark.usefixtures("restore_redis_inmem_per_function")

@@ -5,10 +5,12 @@
 
 import { Canvas3d } from 'cvat-canvas3d/src/typescript/canvas3d';
 import { Canvas, RectDrawingMethod, CuboidDrawingMethod } from 'cvat-canvas-wrapper';
+import { OrientationVisibility } from 'cvat-canvas3d-wrapper';
 import {
     Webhook, MLModel, Organization, Job, Task, Project, Label, User,
     QualityConflict, FramesMetaData, RQStatus, Event, Invitation, SerializedAPISchema,
     Request, JobValidationLayout, QualitySettings, TaskValidationLayout, ObjectState,
+    ConsensusSettings, AboutData,
 } from 'cvat-core-wrapper';
 import { IntelligentScissors } from 'utils/opencv-wrapper/intelligent-scissors';
 import { KeyMap, KeyMapItem } from 'utils/mousetrap-react';
@@ -35,6 +37,12 @@ interface Preview {
     fetching: boolean;
     initialized: boolean;
     preview: string;
+}
+
+export enum InstanceType {
+    PROJECT = 'project',
+    TASK = 'task',
+    JOB = 'job',
 }
 
 export interface ProjectsState {
@@ -168,6 +176,18 @@ export interface ImportState {
         };
     };
     instanceType: 'project' | 'task' | 'job' | null;
+}
+
+export interface ConsensusState {
+    fetching: boolean;
+    consensusSettings: ConsensusSettings | null;
+    taskInstance: Task | null;
+    jobInstance: Job | null;
+    actions: {
+        merging: {
+            [instanceKey: string]: boolean;
+        };
+    }
 }
 
 export interface FormatsState {
@@ -317,6 +337,9 @@ export interface PluginsState {
         taskActions: {
             items: PluginComponent[];
         };
+        jobActions: {
+            items: PluginComponent[];
+        };
         taskItem: {
             ribbon: PluginComponent[];
         };
@@ -336,7 +359,7 @@ export interface PluginsState {
 }
 
 export interface AboutState {
-    server: any;
+    server: AboutData;
     packageVersion: {
         ui: string;
     };
@@ -391,12 +414,6 @@ export type OpenCVTool = IntelligentScissors | OpenCVTracker;
 export interface ToolsBlockerState {
     algorithmsLocked?: boolean;
     buttonVisible?: boolean;
-}
-
-export enum TaskStatus {
-    ANNOTATION = 'annotation',
-    REVIEW = 'validation',
-    COMPLETED = 'completed',
 }
 
 export interface ActiveInference {
@@ -476,6 +493,7 @@ export interface NotificationsState {
             exporting: null | ErrorState;
             importing: null | ErrorState;
             moving: null | ErrorState;
+            mergingConsensus: null | ErrorState;
         };
         jobs: {
             updating: null | ErrorState;
@@ -599,6 +617,7 @@ export interface NotificationsState {
             loadingDone: null | NotificationState;
             importingDone: null | NotificationState;
             movingDone: null | NotificationState;
+            mergingConsensusDone: null | NotificationState;
         };
         models: {
             inferenceDone: null | NotificationState;
@@ -653,23 +672,6 @@ export enum ActiveControl {
     AI_TOOLS = 'ai_tools',
     PHOTO_CONTEXT = 'PHOTO_CONTEXT',
     OPENCV_TOOLS = 'opencv_tools',
-}
-
-export enum ShapeType {
-    RECTANGLE = 'rectangle',
-    POLYGON = 'polygon',
-    POLYLINE = 'polyline',
-    POINTS = 'points',
-    ELLIPSE = 'ellipse',
-    CUBOID = 'cuboid',
-    MASK = 'mask',
-    SKELETON = 'skeleton',
-}
-
-export enum ObjectType {
-    SHAPE = 'shape',
-    TRACK = 'track',
-    TAG = 'tag',
 }
 
 export enum StatesOrdering {
@@ -895,6 +897,7 @@ export interface ShapesSettingsState {
     showBitmap: boolean;
     showProjections: boolean;
     showGroundTruth: boolean;
+    orientationVisibility: OrientationVisibility;
 }
 
 export interface SettingsState {
@@ -910,11 +913,6 @@ export interface ShortcutsState {
     keyMap: KeyMap;
     normalizedKeyMap: Record<string, string>;
     defaultState: Record<string, KeyMapItem>
-}
-
-export enum StorageLocation {
-    LOCAL = 'local',
-    CLOUD_STORAGE = 'cloud_storage',
 }
 
 export enum ReviewStatus {
@@ -944,6 +942,14 @@ export interface ReviewState {
         jobId: number | null;
         issueId: number | null;
     };
+}
+
+export interface OrganizationMembersQuery {
+    search: string | null;
+    filter: string | null;
+    sort: string | null;
+    page: number;
+    pageSize: number;
 }
 
 export interface OrganizationState {
@@ -1018,6 +1024,7 @@ export interface CombinedState {
     review: ReviewState;
     export: ExportState;
     import: ImportState;
+    consensus: ConsensusState;
     cloudStorages: CloudStoragesState;
     organizations: OrganizationState;
     invitations: InvitationsState;
