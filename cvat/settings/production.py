@@ -29,3 +29,21 @@ LOGGING["loggers"]["uvicorn.access"] = {
     "level": "INFO",
     "propagate": False,
 }
+
+# https://github.com/pennersr/django-allauth
+ACCOUNT_AUTHENTICATION_METHOD = "username_email"
+ACCOUNT_CONFIRM_EMAIL_ON_GET = True
+ACCOUNT_EMAIL_REQUIRED = True
+ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+
+# Email backend settings for Django
+if os.getenv("EMAIL_HOST"):
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    EMAIL_HOST = os.getenv("EMAIL_HOST")
+    EMAIL_PORT = os.getenv("EMAIL_PORT")
+    EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
+    EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
+    EMAIL_USE_TLS = to_bool(os.getenv("EMAIL_USE_TLS"))
+    EMAIL_USE_SSL = to_bool(os.getenv("EMAIL_USE_SSL"))
+    EMAIL_TIMEOUT = os.getenv("EMAIL_TIMEOUT")
+    DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL")
