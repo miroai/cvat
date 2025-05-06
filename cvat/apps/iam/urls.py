@@ -34,7 +34,6 @@ urlpatterns = [
 
 if settings.IAM_TYPE == "BASIC":
     urlpatterns += [
-        path("register", RegisterViewEx.as_view(), name=BASIC_REGISTER_PATH_NAME),
         # password
         path("password/reset", PasswordResetView.as_view(), name="rest_password_reset"),
         path(
@@ -44,6 +43,10 @@ if settings.IAM_TYPE == "BASIC":
         ),
         path("password/change", PasswordChangeView.as_view(), name="rest_password_change"),
     ]
+    if settings.IAM_REGISTRATION_ENABLED:
+        urlpatterns.append(
+            path('register', RegisterViewEx.as_view(), name=BASIC_REGISTER_PATH_NAME)
+        )
     if allauth_settings.EMAIL_VERIFICATION != allauth_settings.EmailVerificationMethod.NONE:
         # emails
         urlpatterns += [
