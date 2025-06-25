@@ -148,7 +148,7 @@ cvat:
         extraArgs: []
     replicas: 1
     image: cvat/server
-    tag: v2.35.0-miroai
+    tag: v2.39.0
     imagePullPolicy: Always
     permissionFix:
       enabled: true
@@ -173,7 +173,7 @@ cvat:
   frontend:
     replicas: 1
     image: cvat/ui
-    tag: v2.35.0-miroai
+    tag: v2.39.0
     imagePullPolicy: Always
     labels: {}
     #  test: test
@@ -459,7 +459,7 @@ grafana:
   dashboardsConfigMaps:
     default: "cvat-grafana-dashboards"
   plugins:
-    - grafana-clickhouse-datasource
+    - grafana-clickhouse-datasource 4.8.2
   grafana.ini:
     server:
       root_url: https://cvat.local/analytics
