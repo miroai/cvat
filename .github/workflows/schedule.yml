@@ -144,12 +144,11 @@ jobs:
 
       - name: REST API and SDK tests
         run: |
+          echo 'Run 1: without cache'
           pytest tests/python/ --alluredir=tests/python/allure-results
           pytest tests/python/ --stop-services
 
-          ONE_RUNNING_JOB_IN_QUEUE_PER_USER="true" pytest tests/python/rest_api/test_queues.py
-          pytest tests/python/ --stop-services
-
+          echo 'Run 2: with cache'
           CVAT_ALLOW_STATIC_CACHE="true" pytest tests/python
           pytest tests/python/ --stop-services
 
@@ -259,7 +258,8 @@ jobs:
       - name: Run tests
         run: |
           cd ./tests
-          yarn --frozen-lockfile
+          corepack enable yarn
+          yarn --immutable
 
           shopt -s extglob
           if [[ ${{ matrix.specs }} == canvas3d_* ]]; then

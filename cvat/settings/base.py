@@ -21,7 +21,7 @@ import sys
 import tempfile
 import urllib
 from datetime import timedelta
-from enum import Enum
+from enum import Enum, IntEnum
 
 from attr.converters import to_bool
 from corsheaders.defaults import default_headers
@@ -140,7 +140,7 @@ REST_FRAMEWORK = {
         "rest_framework.authentication.TokenAuthentication",
         "cvat.apps.iam.authentication.SignatureAuthentication",
         "rest_framework.authentication.SessionAuthentication",
-        "rest_framework.authentication.BasicAuthentication",
+        "cvat.apps.iam.authentication.BasicAuthenticationEx",
     ],
     "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.AcceptHeaderVersioning",
     "ALLOWED_VERSIONS": ("2.0"),
@@ -287,10 +287,16 @@ redis_inmem_host = os.getenv("CVAT_REDIS_INMEM_HOST", "localhost")
 redis_inmem_port = os.getenv("CVAT_REDIS_INMEM_PORT", 6379)
 redis_inmem_password = os.getenv("CVAT_REDIS_INMEM_PASSWORD", "")
 
+
+class REDIS_INMEM_DATABASES(IntEnum):
+    RQ = 0
+    CACHE = 1
+
+
 REDIS_INMEM_SETTINGS = {
     "HOST": redis_inmem_host,
     "PORT": redis_inmem_port,
-    "DB": 0,
+    "DB": REDIS_INMEM_DATABASES.RQ,
     "PASSWORD": redis_inmem_password,
 }
 
@@ -469,9 +475,6 @@ os.makedirs(ASSETS_ROOT, exist_ok=True)
 SHARE_ROOT = os.path.join(BASE_DIR, "share")
 os.makedirs(SHARE_ROOT, exist_ok=True)
 
-MODELS_ROOT = os.path.join(DATA_ROOT, "models")
-os.makedirs(MODELS_ROOT, exist_ok=True)
-
 LOGS_ROOT = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOGS_ROOT, exist_ok=True)
 
@@ -578,7 +581,8 @@ CVAT_PREVIEW_CACHE_TTL = 3600 * 24 * 7  # 7 days
 
 CACHES = {
     "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": f"redis://:{urllib.parse.quote(redis_inmem_password)}@{redis_inmem_host}:{redis_inmem_port}/{REDIS_INMEM_DATABASES.CACHE}",
     },
     "media": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
@@ -771,8 +775,7 @@ from cvat.rq_patching import patch_rq
 
 patch_rq()
 
-CLOUD_DATA_DOWNLOADING_MAX_THREADS_NUMBER = 4
-CLOUD_DATA_DOWNLOADING_NUMBER_OF_FILES_PER_THREAD = 1000
+CLOUD_DATA_DOWNLOADING_MAX_THREADS_NUMBER_PER_CPU = 4
 
 # Indicates the maximum number of days a file or directory is retained in the temporary directory
 TMP_FILE_OR_DIR_RETENTION_DAYS = 3

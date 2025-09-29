@@ -148,7 +148,7 @@ cvat:
         extraArgs: []
     replicas: 1
     image: cvat/server
-    tag: v2.40.0
+    tag: v2.45.0
     imagePullPolicy: Always
     permissionFix:
       enabled: true
@@ -173,7 +173,7 @@ cvat:
   frontend:
     replicas: 1
     image: cvat/ui
-    tag: v2.40.0
+    tag: v2.45.0
     imagePullPolicy: Always
     labels: {}
     #  test: test
@@ -217,8 +217,8 @@ cvat:
     service:
       type: ClusterIP
       ports:
-        - port: 80
-          targetPort: 80
+        - port: 8000
+          targetPort: 8000
           protocol: TCP
           name: http
   opa:
@@ -334,6 +334,8 @@ cvat:
 postgresql:
   #See https://github.com/bitnami/charts/blob/master/bitnami/postgresql/ for more info
   enabled: true # false for external db
+  image:
+    repository: bitnamilegacy/postgresql
   external:
     # Ignored if an empty value is set
     host: ""
@@ -357,6 +359,8 @@ postgresql:
 # https://artifacthub.io/packages/helm/bitnami/redis
 redis:
   enabled: true
+  image:
+    repository: bitnamilegacy/redis
   external:
     host: 127.0.0.1
   architecture: standalone
@@ -400,23 +404,30 @@ vector:
   dataDir: "/vector-data-dir"
   containerPorts:
     - name: http
-      containerPort: 80
+      containerPort: 8282
       protocol: TCP
   service:
     ports:
       - name: http
-        port: 80
+        port: 8282
         protocol: TCP
   image:
     tag: "0.26.0-alpine"
+  securityContext:
+    runAsNonRoot: true
+
+    # Workaround for <https://github.com/vectordotdev/vector/issues/1599>.
+    runAsUser: 1000
+    runAsGroup: 1000
 
 clickhouse:
   # Set to false in case of external db usage
   enabled: true
+  image:
+    repository: bitnamilegacy/clickhouse
   shards: 1
   replicaCount: 1
   extraEnvVarsSecret: cvat-analytics-secret
-  initdbScriptsSecret: cvat-clickhouse-init
   auth:
     username: user
     existingSecret: cvat-analytics-secret

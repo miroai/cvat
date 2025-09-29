@@ -17,7 +17,7 @@ import traceback
 import urllib.parse
 from collections import defaultdict, namedtuple
 from collections.abc import Generator, Iterable, Mapping, Sequence
-from contextlib import nullcontext, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from itertools import islice
 from multiprocessing import cpu_count
 from pathlib import Path
@@ -29,6 +29,7 @@ from av import VideoFrame
 from datumaro.util.os_util import walk
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db import connection, transaction
 from django.utils.http import urlencode
 from django_rq.queues import DjangoRQ
 from django_sendfile import sendfile as _sendfile
@@ -263,17 +264,31 @@ def get_cpu_number() -> int:
             # we cannot use just multiprocessing.cpu_count because when it runs
             # inside a docker container, it will just return the number of CPU cores
             # for the physical machine the container runs on
+
+            # cgroups v1
             cfs_quota_us_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
             cfs_period_us_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+
+            # cgroup v2
+            cpu_max_path = Path("/sys/fs/cgroup/cpu.max")
 
             if cfs_quota_us_path.exists() and cfs_period_us_path.exists():
                 with open(cfs_quota_us_path) as fp:
                     cfs_quota_us = int(fp.read())
                 with open(cfs_period_us_path) as fp:
                     cfs_period_us = int(fp.read())
-                container_cpu_number = cfs_quota_us // cfs_period_us
-                # For physical machine, the `cfs_quota_us` could be '-1'
-                cpu_number = cpu_count() if container_cpu_number < 1 else container_cpu_number
+                if cfs_quota_us == -1:  # No quota
+                    cpu_number = cpu_count()
+                else:
+                    cpu_number = max(cfs_quota_us // cfs_period_us, 1)
+            elif cpu_max_path.exists():
+                with open(cpu_max_path) as fp:
+                    quota_str, period_str = fp.read().strip().split()
+                if quota_str == "max":  # No quota
+                    cpu_number = cpu_count()
+                else:
+                    cpu_number = max(int(quota_str) // int(period_str), 1)
+
         cpu_number = cpu_number or cpu_count()
     except NotImplementedError:
         # the number of cpu cannot be determined
@@ -335,11 +350,13 @@ def build_backup_file_name(
     class_name: str,
     identifier: str | int,
     timestamp: str,
+    lightweight: bool,
 ) -> str:
     # "<project|task>_<name>_backup_<timestamp>.zip"
-    return "{}_{}_backup_{}.zip".format(
+    return "{}_{}_backup{}_{}.zip".format(
         class_name,
         identifier,
+        ("-lightweight" if lightweight else ""),
         timestamp,
     ).lower()
 
@@ -467,3 +484,12 @@ def defaultdict_to_regular(d):
     if isinstance(d, defaultdict):
         d = {k: defaultdict_to_regular(v) for k, v in d.items()}
     return d
+
+
+@contextmanager
+def transaction_with_repeatable_read():
+    with transaction.atomic():
+        if connection.vendor != "sqlite":
+            connection.cursor().execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+            connection.cursor().execute("SET TRANSACTION READ ONLY;")
+        yield

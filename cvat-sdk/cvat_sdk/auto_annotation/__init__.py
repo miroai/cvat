@@ -6,9 +6,14 @@ from .driver import annotate_task
 from .exceptions import BadFunctionError
 from .interface import (
     AutoAnnotationFunction,
+    DetectionAnnotation,
     DetectionFunction,
     DetectionFunctionContext,
     DetectionFunctionSpec,
+    TrackableShape,
+    TrackingFunctionContext,
+    TrackingFunctionShapeContext,
+    TrackingFunctionSpec,
     attribute_spec,
     checkbox_attribute_spec,
     keypoint,
@@ -23,6 +28,7 @@ from .interface import (
     shape,
     skeleton,
     skeleton_label_spec,
+    tag,
     text_attribute_spec,
 )
 
@@ -32,9 +38,14 @@ __all__ = [
     "attribute_spec",
     "BadFunctionError",
     "checkbox_attribute_spec",
+    "DetectionAnnotation",
     "DetectionFunction",
     "DetectionFunctionContext",
     "DetectionFunctionSpec",
+    "TrackableShape",
+    "TrackingFunctionContext",
+    "TrackingFunctionShapeContext",
+    "TrackingFunctionSpec",
     "keypoint_spec",
     "keypoint",
     "label_spec",
@@ -47,5 +58,6 @@ __all__ = [
     "shape",
     "skeleton_label_spec",
     "skeleton",
+    "tag",
     "text_attribute_spec",
 ]
