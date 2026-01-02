@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 import React, { useCallback } from 'react';
-import moment from 'moment';
+import dayjs from 'dayjs';
 import { useSelector } from 'react-redux';
 import { useHistory } from 'react-router';
 import Text from 'antd/lib/typography/Text';
@@ -16,7 +16,7 @@ import { MoreOutlined } from '@ant-design/icons';
 
 import { CombinedState } from 'reducers';
 import { Project } from 'cvat-core-wrapper';
-import { useCardHeightHOC, usePlugins } from 'utils/hooks';
+import { useCardHeightHOC, usePlugins, useContextMenuClick } from 'utils/hooks';
 import Preview from 'components/common/preview';
 import ProjectActionsComponent from './actions-menu';
 
@@ -44,8 +44,9 @@ export default function ProjectItemComponent(props: Props): JSX.Element {
     const history = useHistory();
     const ribbonPlugins = usePlugins((state: CombinedState) => state.plugins.components.projectItem.ribbon, props);
     const height = useCardHeight();
+    const { itemRef, handleContextMenuClick } = useContextMenuClick<HTMLDivElement>();
     const ownerName = instance.owner ? instance.owner.username : null;
-    const updated = moment(instance.updatedDate).fromNow();
+    const updated = dayjs(instance.updatedDate).fromNow();
     const deletes = useSelector((state: CombinedState) => state.projects.activities.deletes);
     const deleted = instance.id in deletes ? deletes[instance.id] : false;
 
@@ -83,6 +84,7 @@ export default function ProjectItemComponent(props: Props): JSX.Element {
                 dropdownTrigger={['contextMenu']}
                 triggerElement={(
                     <Card
+                        ref={itemRef}
                         cover={(
                             <Preview
                                 project={instance}
@@ -125,16 +127,12 @@ export default function ProjectItemComponent(props: Props): JSX.Element {
                                         <Text type='secondary'>{`Last updated ${updated}`}</Text>
                                     </div>
                                     <div>
-                                        <ProjectActionsComponent
-                                            projectInstance={instance}
-                                            triggerElement={(
-                                                <Button
-                                                    className='cvat-project-details-button cvat-actions-menu-button'
-                                                    type='link'
-                                                    size='large'
-                                                    icon={<MoreOutlined />}
-                                                />
-                                            )}
+                                        <Button
+                                            className='cvat-project-details-button cvat-actions-menu-button'
+                                            type='link'
+                                            size='large'
+                                            icon={<MoreOutlined />}
+                                            onClick={handleContextMenuClick}
                                         />
                                     </div>
                                 </div>

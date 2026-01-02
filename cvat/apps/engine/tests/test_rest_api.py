@@ -22,6 +22,7 @@ from enum import Enum
 from glob import glob
 from io import BytesIO, IOBase
 from itertools import product
+from pathlib import Path
 from pprint import pformat
 from time import sleep
 from typing import BinaryIO
@@ -30,6 +31,8 @@ from unittest import mock
 import av
 import django_rq
 import numpy as np
+from azure.core.exceptions import HttpResponseError, ServiceRequestError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from django.conf import settings
 from django.contrib.auth.models import Group, User
 from django.http import FileResponse, HttpResponse
@@ -46,7 +49,7 @@ from rq.queue import Queue as RQQueue
 from cvat.apps.dataset_manager.tests.utils import TestDir
 from cvat.apps.dataset_manager.util import current_function_name
 from cvat.apps.engine.cache import MediaCache
-from cvat.apps.engine.cloud_provider import AWS_S3, Status
+from cvat.apps.engine.cloud_provider import AzureBlobCloudStorage, S3CloudStorage, Status
 from cvat.apps.engine.media_extractors import ValidateDimension, sort
 from cvat.apps.engine.models import (
     AttributeSpec,
@@ -73,9 +76,11 @@ from cvat.apps.engine.tests.utils import (
     generate_video_file,
     get_paginated_collection,
 )
+from cvat.apps.redis_handler.serializers import RequestStatus
 from utils.dataset_manifest import ImageManifestManager, VideoManifestManager
+from utils.dataset_manifest.utils import MemOpenable, PcdReader, find_related_images
 
-from .utils import check_annotation_response, compare_objects
+from .utils import ASSETS_DIR, check_annotation_response, compare_objects
 
 # suppress av warnings
 logging.getLogger("libav").setLevel(logging.ERROR)
@@ -515,6 +520,14 @@ class JobDataMetaPartialUpdateAPITestCase(ApiTestBase):
 
         data = {"deleted_frames": []}
         self._check_api_v1_jobs_data_meta_id(self.admin, data)
+
+    def test_api_v1_jobs_data_meta_updated_date(self):
+        with ForceLogin(self.admin, self.client):
+            res = self.client.get(f"/api/tasks/{self.task.id}")
+            data = {"deleted_frames": [1]}
+            self.client.patch(f"/api/jobs/{self.job.id}/data/meta", data=data, format="json")
+            res2 = self.client.get(f"/api/tasks/{self.task.id}")
+            self.assertLess(res.data["updated_date"], res2.data["updated_date"])
 
 
 class ServerAboutAPITestCase(ApiTestBase):
@@ -1458,7 +1471,9 @@ class ProjectBackupAPITestCase(ExportApiTestBase, ImportApiTestBase):
             video.write(data.read())
 
         manifest_path = os.path.join(settings.SHARE_ROOT, "videos", "manifest.jsonl")
-        generate_manifest_file(data_type="video", manifest_path=manifest_path, sources=[path])
+        generate_manifest_file(
+            data_type=ManifestDataType.video, manifest_path=manifest_path, sources=[path]
+        )
 
         cls.media_data.append(
             {
@@ -1472,11 +1487,12 @@ class ProjectBackupAPITestCase(ExportApiTestBase, ImportApiTestBase):
 
         manifest_path = manifest_path = os.path.join(settings.SHARE_ROOT, "manifest.jsonl")
         generate_manifest_file(
-            data_type="images",
+            data_type=ManifestDataType.images,
             manifest_path=manifest_path,
             sources=[
                 os.path.join(settings.SHARE_ROOT, imagename_pattern.format(i)) for i in range(1, 8)
             ],
+            root_dir=settings.SHARE_ROOT,
         )
         cls.media["files"].append(manifest_path)
         cls.media_data.append(
@@ -1823,7 +1839,7 @@ class ProjectBackupAPITestCase(ExportApiTestBase, ImportApiTestBase):
 class _CloudStorageTestBase(ApiTestBase):
     @classmethod
     def _start_aws_patch(cls):
-        class MockAWS(AWS_S3):
+        class MockS3(S3CloudStorage):
             _files = {}
 
             def get_status(self):
@@ -1842,10 +1858,10 @@ class _CloudStorageTestBase(ApiTestBase):
             def _download_fileobj_to_stream(self, key: str, stream: BinaryIO, /):
                 stream.write(self._files[key])
 
-        cls._aws_patch = mock.patch("cvat.apps.engine.cloud_provider.AWS_S3", MockAWS)
+        cls._aws_patch = mock.patch("cvat.apps.engine.cloud_provider.S3CloudStorage", MockS3)
         cls._aws_patch.start()
 
-        return MockAWS
+        return MockS3
 
     @classmethod
     def _stop_aws_patch(cls):
@@ -1889,7 +1905,11 @@ class ProjectCloudBackupAPINoStaticChunksTestCase(ProjectBackupAPITestCase, _Clo
 
         if cls.MAKE_LIGHTWEIGHT_BACKUP or settings.MEDIA_CACHE_ALLOW_STATIC_CACHE:
             # should not load anything from CS anymore
-            cls.mock_aws._download_fileobj_to_stream = None
+
+            def disabled(*args):
+                raise RuntimeError("Disabled!")
+
+            cls.mock_aws._download_fileobj_to_stream = disabled
 
     @classmethod
     def tearDownClass(cls):
@@ -2075,21 +2095,21 @@ class ProjectImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
 
         def _create_task(task_data, media_data):
             response = self.client.post("/api/tasks", data=task_data, format="json")
-            assert response.status_code == status.HTTP_201_CREATED
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
             tid = response.data["id"]
 
             for media in media_data.values():
                 if isinstance(media, io.BytesIO):
                     media.seek(0)
             response = self.client.post("/api/tasks/{}/data".format(tid), data=media_data)
-            assert response.status_code == status.HTTP_202_ACCEPTED
+            self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
             rq_id = response.json()["rq_id"]
 
             response = self.client.get(f"/api/requests/{rq_id}")
-            assert response.status_code == status.HTTP_200_OK, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
             response_json = response.json()
             rqjob_status, msg = response_json["status"], response_json["message"]
-            assert rqjob_status == "finished", f"{rqjob_status=}\n{msg=}"
+            self.assertEqual(rqjob_status, "finished", f"Message: {msg}")
 
             response = self.client.get("/api/tasks/{}".format(tid))
             data_id = response.data["data"]
@@ -2126,7 +2146,7 @@ class ProjectImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
 
         def _create_project(project_data):
             response = self.client.post("/api/projects", data=project_data, format="json")
-            assert response.status_code == status.HTTP_201_CREATED
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
             self.projects.append(response.data)
 
         project_data = [
@@ -2565,6 +2585,14 @@ class TaskDataMetaPartialUpdateAPITestCase(ApiTestBase):
 
         data = {"deleted_frames": []}
         self._check_api_v1_task_data_id(self.user, data)
+
+    def test_api_v1_tasks_data_meta_updated_date(self):
+        with ForceLogin(self.admin, self.client):
+            res = self.client.get(f"/api/tasks/{self.tasks[0].id}")
+            data = {"deleted_frames": [1, 2, 3]}
+            self.client.patch(f"/api/tasks/{self.tasks[0].id}/data/meta", data=data, format="json")
+            res2 = self.client.get(f"/api/tasks/{self.tasks[0].id}")
+            self.assertLess(res.data["updated_date"], res2.data["updated_date"])
 
 
 class TaskUpdateLabelsAPITestCase(UpdateLabelsAPITestCase):
@@ -3046,9 +3074,8 @@ class TaskImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
         )
 
         filename = "test_pointcloud_pcd.zip"
-        source_path = os.path.join(os.path.dirname(__file__), "assets", filename)
         path = os.path.join(settings.SHARE_ROOT, filename)
-        shutil.copyfile(source_path, path)
+        shutil.copyfile(ASSETS_DIR / filename, path)
         cls.media_data.append(
             {
                 "image_quality": 75,
@@ -3057,9 +3084,8 @@ class TaskImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
         )
 
         filename = "test_velodyne_points.zip"
-        source_path = os.path.join(os.path.dirname(__file__), "assets", filename)
-        path = os.path.join(settings.SHARE_ROOT, filename)
-        shutil.copyfile(source_path, path)
+        path = settings.SHARE_ROOT / filename
+        shutil.copyfile(ASSETS_DIR / filename, path)
         cls.media_data.append(
             {
                 "image_quality": 75,
@@ -3077,6 +3103,27 @@ class TaskImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
                 }
             )
 
+            if sorting == SortingMethod.PREDEFINED:
+                # Manifest is required for predefined sorting with an archive
+                manifest_path = path.with_suffix(".jsonl")
+                with (
+                    tempfile.TemporaryDirectory() as temp_dir,
+                    zipfile.ZipFile(path, "r") as zip_file,
+                ):
+                    zip_file.extractall(temp_dir)
+
+                    generate_manifest_file(
+                        ManifestDataType.point_clouds,
+                        manifest_path,
+                        glob(os.path.join(temp_dir, "**/*.*"), recursive=True),
+                        sorting_method=SortingMethod.PREDEFINED,
+                        root_dir=temp_dir,
+                    )
+
+                cls.media_data[-1]["server_files[1]"] = os.path.join(
+                    settings.SHARE_ROOT, manifest_path.name
+                )
+
         filename = os.path.join("videos", "test_video_1.mp4")
         path = os.path.join(settings.SHARE_ROOT, filename)
         os.makedirs(os.path.dirname(path))
@@ -3085,7 +3132,7 @@ class TaskImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
             video.write(data.read())
 
         generate_manifest_file(
-            data_type="video",
+            data_type=ManifestDataType.video,
             manifest_path=os.path.join(settings.SHARE_ROOT, "videos", "manifest.jsonl"),
             sources=[path],
         )
@@ -3101,11 +3148,12 @@ class TaskImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
         )
 
         generate_manifest_file(
-            data_type="images",
+            data_type=ManifestDataType.images,
             manifest_path=os.path.join(settings.SHARE_ROOT, "manifest.jsonl"),
             sources=[
                 os.path.join(settings.SHARE_ROOT, imagename_pattern.format(i)) for i in range(1, 8)
             ],
+            root_dir=settings.SHARE_ROOT,
         )
         cls.media_data.append(
             {
@@ -3229,21 +3277,21 @@ class TaskImportExportAPITestCase(ExportApiTestBase, ImportApiTestBase):
 
         def _create_task(task_data, media_data):
             response = self.client.post("/api/tasks", data=task_data, format="json")
-            assert response.status_code == status.HTTP_201_CREATED
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
             tid = response.data["id"]
 
             for media in media_data.values():
                 if isinstance(media, io.BytesIO):
                     media.seek(0)
             response = self.client.post("/api/tasks/{}/data".format(tid), data=media_data)
-            assert response.status_code == status.HTTP_202_ACCEPTED, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
             rq_id = response.json()["rq_id"]
 
             response = self.client.get(f"/api/requests/{rq_id}")
-            assert response.status_code == status.HTTP_200_OK, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
             response_json = response.json()
             rqjob_status, msg = response_json["status"], response_json["message"]
-            assert rqjob_status == "finished", f"{rqjob_status=}\n{msg=}"
+            self.assertEqual(rqjob_status, "finished", f"Message: {msg}")
 
             response = self.client.get("/api/tasks/{}".format(tid))
             data_id = response.data["data"]
@@ -3492,8 +3540,14 @@ def generate_pdf_file(filename, page_count=1):
     return image_sizes, file_buf
 
 
+class ManifestDataType(str, Enum):
+    video = "video"
+    images = "images"
+    point_clouds = "point_clouds"
+
+
 def generate_manifest_file(
-    data_type,
+    data_type: ManifestDataType,
     manifest_path,
     sources,
     *,
@@ -3501,21 +3555,27 @@ def generate_manifest_file(
     root_dir=None,
 ):
     if data_type == "video":
-        kwargs = {
-            "media_file": sources[0],
-            "upload_dir": os.path.dirname(sources[0]),
-            "force": True,
-        }
         manifest = VideoManifestManager(manifest_path, create_index=False)
+        manifest.link(media_file=Path(sources[0]), force=True)
     else:
-        kwargs = {
-            "sources": sources,
-            "sorting_method": sorting_method,
-            "use_image_hash": True,
-            "data_dir": root_dir,
-        }
+        assert root_dir
+
+        scenes, related_images = find_related_images(sources, root_path=root_dir)
+
         manifest = ImageManifestManager(manifest_path, create_index=False)
-    manifest.link(**kwargs)
+        manifest.link(
+            sources=[
+                Path(p)
+                for p in sources
+                if (root_dir is not None and os.path.relpath(p, root_dir) or p) in scenes
+            ],
+            sorting_method=sorting_method,
+            use_image_hash=True,
+            data_dir=root_dir,
+            DIM_3D=data_type == ManifestDataType.point_clouds,
+            meta={k: {"related_images": related_images[k]} for k in related_images},
+        )
+
     manifest.create()
 
 
@@ -3575,13 +3635,11 @@ class TaskDataAPITestCase(ApiTestBase):
         cls._share_files.append(filename)
 
         filename = "test_rotated_90_video.mp4"
-        path = os.path.join(os.path.dirname(__file__), "assets", "test_rotated_90_video.mp4")
-        container = av.open(path, "r")
-        for frame in container.decode(video=0):
-            # pyav ignores rotation record in metadata when decoding frames
-            img_sizes = [(frame.height, frame.width)] * container.streams.video[0].frames
-            break
-        container.close()
+        with av.open(ASSETS_DIR / "test_rotated_90_video.mp4", "r") as container:
+            for frame in container.decode(video=0):
+                # pyav ignores rotation record in metadata when decoding frames
+                img_sizes = [(frame.height, frame.width)] * container.streams.video[0].frames
+                break
         cls._share_image_sizes[filename] = img_sizes
 
         filename = os.path.join("videos", "test_video_1.mp4")
@@ -3602,19 +3660,20 @@ class TaskDataAPITestCase(ApiTestBase):
         cls._share_files.append(filename)
 
         filename = "test_pointcloud_pcd.zip"
-        path = os.path.join(os.path.dirname(__file__), "assets", filename)
         image_sizes = []
-        # container = av.open(path, 'r')
-        zip_file = zipfile.ZipFile(path)
-        for info in zip_file.namelist():
-            if info.rsplit(".", maxsplit=1)[-1] == "pcd":
-                with zip_file.open(info, "r") as file:
-                    data = ValidateDimension.get_pcd_properties(file)
-                    image_sizes.append((int(data["WIDTH"]), int(data["HEIGHT"])))
+        with zipfile.ZipFile(ASSETS_DIR / filename) as zip_file:
+            for info in zip_file.namelist():
+                if not info.endswith(".pcd"):
+                    continue
+
+                pcd_properties = ValidateDimension.get_pcd_properties(zipfile.Path(zip_file, info))
+
+                image_sizes.append((int(pcd_properties["WIDTH"]), int(pcd_properties["HEIGHT"])))
+
         cls._share_image_sizes[filename] = image_sizes
 
         filename = "test_rar.rar"
-        source_path = os.path.join(os.path.dirname(__file__), "assets", filename)
+        source_path = ASSETS_DIR / filename
         path = os.path.join(settings.SHARE_ROOT, filename)
         shutil.copyfile(source_path, path)
         image_sizes = []
@@ -3626,32 +3685,16 @@ class TaskDataAPITestCase(ApiTestBase):
         cls._share_files.append(filename)
 
         filename = "test_velodyne_points.zip"
-        path = os.path.join(os.path.dirname(__file__), "assets", filename)
         image_sizes = []
+        with zipfile.ZipFile(ASSETS_DIR / filename) as zip_file:
+            for info in zip_file.namelist():
+                if not info.endswith(".bin"):
+                    continue
 
-        # create zip instance
-        zip_file = zipfile.ZipFile(path, mode="a")
+                pcd_bytes = PcdReader.convert_bin_to_pcd_buffer(zipfile.Path(zip_file, info))
 
-        source_path = []
-        root_path = os.path.abspath(os.path.split(path)[0])
-
-        for info in zip_file.namelist():
-            if os.path.splitext(info)[1][1:] == "bin":
-                zip_file.extract(info, root_path)
-                bin_path = os.path.abspath(os.path.join(root_path, info))
-                source_path.append(ValidateDimension.convert_bin_to_pcd(bin_path))
-
-        for path in source_path:
-            zip_file.write(path, os.path.abspath(path.replace(root_path, "")))
-
-        for info in zip_file.namelist():
-            if os.path.splitext(info)[1][1:] == "pcd":
-                with zip_file.open(info, "r") as file:
-                    data = ValidateDimension.get_pcd_properties(file)
-                    image_sizes.append((int(data["WIDTH"]), int(data["HEIGHT"])))
-
-        root_path = os.path.abspath(os.path.join(root_path, filename.split(".")[0]))
-        shutil.rmtree(root_path, ignore_errors=True)
+                pcd_properties = ValidateDimension.get_pcd_properties(MemOpenable(pcd_bytes))
+                image_sizes.append((int(pcd_properties["WIDTH"]), int(pcd_properties["HEIGHT"])))
 
         cls._share_image_sizes[filename] = image_sizes
 
@@ -3665,7 +3708,7 @@ class TaskDataAPITestCase(ApiTestBase):
 
         filename = "videos/manifest.jsonl"
         generate_manifest_file(
-            data_type="video",
+            data_type=ManifestDataType.video,
             manifest_path=os.path.join(settings.SHARE_ROOT, filename),
             sources=[os.path.join(settings.SHARE_ROOT, "videos", "test_video_1.mp4")],
         )
@@ -3683,7 +3726,7 @@ class TaskDataAPITestCase(ApiTestBase):
         for ordered in [True, False]:
             filename = "images_manifest{}.jsonl".format("_sorted" if ordered else "")
             generate_manifest_file(
-                data_type="images",
+                data_type=ManifestDataType.images,
                 manifest_path=os.path.join(settings.SHARE_ROOT, filename),
                 sources=[os.path.join(settings.SHARE_ROOT, fn) for fn in image_files],
                 sorting_method=(
@@ -3808,7 +3851,7 @@ class TaskDataAPITestCase(ApiTestBase):
         chunk = zipfile.ZipFile(archive, mode="r")
         if dimension == DimensionType.DIM_3D:
             return [
-                (f, BytesIO(chunk.read(f)))
+                (f, chunk.read(f))
                 for f in sorted(chunk.namelist())
                 if f.rsplit(".", maxsplit=1)[-1] == "pcd"
             ]
@@ -3943,7 +3986,7 @@ class TaskDataAPITestCase(ApiTestBase):
 
             for image_idx, received_image in enumerate(images):
                 if dimension == DimensionType.DIM_3D:
-                    properties = ValidateDimension.get_pcd_properties(received_image)
+                    properties = ValidateDimension.get_pcd_properties(MemOpenable(received_image))
                     self.assertEqual(
                         (int(properties["WIDTH"]), int(properties["HEIGHT"])),
                         expected_image_sizes[image_idx],
@@ -3966,7 +4009,7 @@ class TaskDataAPITestCase(ApiTestBase):
 
             for image_idx, received_image in enumerate(images):
                 if dimension == DimensionType.DIM_3D:
-                    properties = ValidateDimension.get_pcd_properties(received_image)
+                    properties = ValidateDimension.get_pcd_properties(MemOpenable(received_image))
                     self.assertEqual(
                         (int(properties["WIDTH"]), int(properties["HEIGHT"])),
                         expected_image_sizes[image_idx],
@@ -4040,14 +4083,9 @@ class TaskDataAPITestCase(ApiTestBase):
                     ]
 
                 for received_image, source_image in zip(images, source_images):
-                    if dimension == DimensionType.DIM_3D:
-                        server_image = np.array(received_image.getbuffer())
-                        source_image = np.array(source_image.getbuffer())
-                        self.assertTrue(np.array_equal(source_image, server_image))
-                    else:
-                        server_image = np.array(received_image)
-                        source_image = np.array(source_image)
-                        self.assertTrue(np.array_equal(source_image, server_image))
+                    server_image = np.array(received_image)
+                    source_image = np.array(source_image)
+                    self.assertTrue(np.array_equal(source_image, server_image))
 
     def _test_api_v2_tasks_id_data_create_can_upload_local_images(self, user):
         task_spec = {
@@ -4587,24 +4625,24 @@ class TaskDataAPITestCase(ApiTestBase):
             ],
         }
 
-        task_data = {
-            "client_files[0]": open(
-                os.path.join(os.path.dirname(__file__), "assets", "test_rotated_90_video.mp4"), "rb"
-            ),
-            "image_quality": 70,
-            "use_zip_chunks": True,
-        }
-
         image_sizes = self._share_image_sizes["test_rotated_90_video.mp4"]
-        self._test_api_v2_tasks_id_data_spec(
-            user,
-            task_spec,
-            task_data,
-            self.ChunkType.IMAGESET,
-            self.ChunkType.VIDEO,
-            image_sizes,
-            StorageMethodChoice.CACHE,
-        )
+
+        with open(ASSETS_DIR / "test_rotated_90_video.mp4", "rb") as video_file:
+            task_data = {
+                "client_files[0]": video_file,
+                "image_quality": 70,
+                "use_zip_chunks": True,
+            }
+
+            self._test_api_v2_tasks_id_data_spec(
+                user,
+                task_spec,
+                task_data,
+                self.ChunkType.IMAGESET,
+                self.ChunkType.VIDEO,
+                image_sizes,
+                StorageMethodChoice.CACHE,
+            )
 
     def _test_api_v2_tasks_id_data_create_can_use_chunked_cached_local_video(self, user):
         task_spec = {
@@ -4617,25 +4655,25 @@ class TaskDataAPITestCase(ApiTestBase):
             ],
         }
 
-        task_data = {
-            "client_files[0]": open(
-                os.path.join(os.path.dirname(__file__), "assets", "test_rotated_90_video.mp4"), "rb"
-            ),
-            "image_quality": 70,
-            "use_cache": True,
-            "use_zip_chunks": True,
-        }
-
         image_sizes = self._share_image_sizes["test_rotated_90_video.mp4"]
-        self._test_api_v2_tasks_id_data_spec(
-            user,
-            task_spec,
-            task_data,
-            self.ChunkType.IMAGESET,
-            self.ChunkType.VIDEO,
-            image_sizes,
-            StorageMethodChoice.CACHE,
-        )
+
+        with open(ASSETS_DIR / "test_rotated_90_video.mp4", "rb") as video_file:
+            task_data = {
+                "client_files[0]": video_file,
+                "image_quality": 70,
+                "use_cache": True,
+                "use_zip_chunks": True,
+            }
+
+            self._test_api_v2_tasks_id_data_spec(
+                user,
+                task_spec,
+                task_data,
+                self.ChunkType.IMAGESET,
+                self.ChunkType.VIDEO,
+                image_sizes,
+                StorageMethodChoice.CACHE,
+            )
 
     def _test_api_v2_tasks_id_data_create_can_use_mxf_video(self, user):
         task_spec = {
@@ -4669,22 +4707,22 @@ class TaskDataAPITestCase(ApiTestBase):
             ],
         }
 
-        task_data = {
-            "client_files[0]": open(
-                os.path.join(os.path.dirname(__file__), "assets", "test_pointcloud_pcd.zip"), "rb"
-            ),
-            "image_quality": 100,
-        }
         image_sizes = self._share_image_sizes["test_pointcloud_pcd.zip"]
-        self._test_api_v2_tasks_id_data_spec(
-            user,
-            task_spec,
-            task_data,
-            self.ChunkType.IMAGESET,
-            self.ChunkType.IMAGESET,
-            image_sizes,
-            dimension=DimensionType.DIM_3D,
-        )
+
+        with open(ASSETS_DIR / "test_pointcloud_pcd.zip", "rb") as pcd_file:
+            task_data = {
+                "client_files[0]": pcd_file,
+                "image_quality": 100,
+            }
+            self._test_api_v2_tasks_id_data_spec(
+                user,
+                task_spec,
+                task_data,
+                self.ChunkType.IMAGESET,
+                self.ChunkType.IMAGESET,
+                image_sizes,
+                dimension=DimensionType.DIM_3D,
+            )
 
     def _test_api_v2_tasks_id_data_create_can_use_local_pcd_kitti(self, user):
         task_spec = {
@@ -4697,22 +4735,22 @@ class TaskDataAPITestCase(ApiTestBase):
             ],
         }
 
-        task_data = {
-            "client_files[0]": open(
-                os.path.join(os.path.dirname(__file__), "assets", "test_velodyne_points.zip"), "rb"
-            ),
-            "image_quality": 100,
-        }
         image_sizes = self._share_image_sizes["test_velodyne_points.zip"]
-        self._test_api_v2_tasks_id_data_spec(
-            user,
-            task_spec,
-            task_data,
-            self.ChunkType.IMAGESET,
-            self.ChunkType.IMAGESET,
-            image_sizes,
-            dimension=DimensionType.DIM_3D,
-        )
+
+        with open(ASSETS_DIR / "test_velodyne_points.zip", "rb") as pcd_file:
+            task_data = {
+                "client_files[0]": pcd_file,
+                "image_quality": 100,
+            }
+            self._test_api_v2_tasks_id_data_spec(
+                user,
+                task_spec,
+                task_data,
+                self.ChunkType.IMAGESET,
+                self.ChunkType.IMAGESET,
+                image_sizes,
+                dimension=DimensionType.DIM_3D,
+            )
 
     def _test_api_v2_tasks_id_data_create_can_use_server_images_and_manifest(self, user):
         task_spec_common = {
@@ -4857,7 +4895,11 @@ class TaskDataAPITestCase(ApiTestBase):
             for caching_enabled, manifest in product([True, False], [True, False]):
                 manifest_path = os.path.join(test_dir, "manifest.jsonl")
                 generate_manifest_file(
-                    "images", manifest_path, image_paths, sorting_method=SortingMethod.PREDEFINED
+                    ManifestDataType.images,
+                    manifest_path,
+                    image_paths,
+                    sorting_method=SortingMethod.PREDEFINED,
+                    root_dir=test_dir,
                 )
 
                 task_data_common["use_cache"] = caching_enabled
@@ -5015,10 +5057,11 @@ class TaskDataAPITestCase(ApiTestBase):
 
                     manifest_path = os.path.join(test_dir, "manifest.jsonl")
                     generate_manifest_file(
-                        "images",
+                        ManifestDataType.images,
                         manifest_path,
                         image_paths,
                         sorting_method=SortingMethod.PREDEFINED,
+                        root_dir=test_dir,
                     )
 
                     task_data["use_cache"] = caching_enabled
@@ -5142,7 +5185,7 @@ class TaskDataAPITestCase(ApiTestBase):
                 data={"image_quality": task_data["image_quality"]},
                 headers={"Upload-Start": True},
             )
-            assert response.status_code == status.HTTP_202_ACCEPTED, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
             for group_idx, file_group in enumerate(file_groups):
                 request_data = {k: v for k, v in data.items() if "_files" not in k}
@@ -5161,12 +5204,12 @@ class TaskDataAPITestCase(ApiTestBase):
                 )
 
                 if group_idx != len(file_groups) - 1:
-                    assert response.status_code == status.HTTP_200_OK, response.status_code
+                    self.assertEqual(response.status_code, status.HTTP_200_OK)
             return response
 
         def _send_data_and_fail(*args, **kwargs):
             response = _send_data(*args, **kwargs)
-            assert response.status_code == status.HTTP_400_BAD_REQUEST, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
             raise Exception(response.data)
 
         filenames = [
@@ -5563,14 +5606,11 @@ class JobAnnotationAPITestCase(ApiTestBase):
             if dimension == DimensionType.DIM_3D:
                 images = {
                     "client_files[0]": open(
-                        os.path.join(
-                            os.path.dirname(__file__),
-                            "assets",
-                            (
-                                "test_pointcloud_pcd.zip"
-                                if annotation_format == "Sly Point Cloud Format 1.0"
-                                else "test_velodyne_points.zip"
-                            ),
+                        ASSETS_DIR
+                        / (
+                            "test_pointcloud_pcd.zip"
+                            if annotation_format == "Sly Point Cloud Format 1.0"
+                            else "test_velodyne_points.zip"
                         ),
                         "rb",
                     ),
@@ -5578,7 +5618,12 @@ class JobAnnotationAPITestCase(ApiTestBase):
                 }
 
             response = self.client.post("/api/tasks/{}/data".format(tid), data=images)
-            assert response.status_code == status.HTTP_202_ACCEPTED, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+            rq_id = response.data["rq_id"]
+            response = self.client.get(f"/api/requests/{rq_id}")
+            rqjob_status, msg = response.data["status"], response.data["message"]
+            self.assertEqual(rqjob_status, "finished", f"Message: {msg}")
 
             response = self.client.get("/api/tasks/{}".format(tid))
             task = response.data
@@ -7526,6 +7571,11 @@ class ServerShareAPITestCase(ApiTestBase):
         response = self._run_api_v2_server_share(None, "/")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_api_v2_server_share_directory_traversal(self):
+        response = self._run_api_v2_server_share(self.admin, "../")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("is an invalid directory", response.content.decode("utf-8"))
+
 
 class ServerShareDifferentTypesAPITestCase(ApiTestBase):
     @classmethod
@@ -7628,11 +7678,11 @@ class TaskAnnotation2DContext(ApiTestBase):
     def _create_task(self, data, image_data):
         with ForceLogin(self.user, self.client):
             response = self.client.post("/api/tasks", data=data, format="json")
-            assert response.status_code == status.HTTP_201_CREATED, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
             tid = response.data["id"]
 
             response = self.client.post("/api/tasks/%s/data" % tid, data=image_data)
-            assert response.status_code == status.HTTP_202_ACCEPTED, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
             response = self.client.get("/api/tasks/%s" % tid)
             task = response.data
@@ -7663,11 +7713,13 @@ class TaskAnnotation2DContext(ApiTestBase):
                 filename = self.create_zip_archive_with_related_images(
                     test_case, test_dir, context_img_data
                 )
-                img_data = {
-                    "client_files[0]": open(filename, "rb"),
-                    "image_quality": 75,
-                }
-                task = self._create_task(self.task, img_data)
+                with open(filename, "rb") as f:
+                    img_data = {
+                        "client_files[0]": f,
+                        "image_quality": 75,
+                    }
+                    task = self._create_task(self.task, img_data)
+
                 task_id = task["id"]
 
                 response = self._get_request("/api/tasks/%s/data/meta" % task_id, self.admin)
@@ -7681,11 +7733,14 @@ class TaskAnnotation2DContext(ApiTestBase):
             filename = self.create_zip_archive_with_related_images(
                 test_name, test_dir, context_img_data
             )
-            img_data = {
-                "client_files[0]": open(filename, "rb"),
-                "image_quality": 75,
-            }
-            task = self._create_task(self.task, img_data)
+
+            with open(filename, "rb") as f:
+                img_data = {
+                    "client_files[0]": f,
+                    "image_quality": 75,
+                }
+                task = self._create_task(self.task, img_data)
+
             task_id = task["id"]
             query_params = {"quality": "original", "type": "context_image", "number": 0}
             response = self._get_request(
@@ -7752,11 +7807,11 @@ class TaskChangeCloudStorageTestCase(_CloudStorageTestBase):
     def _create_task(self, data, image_data):
         with ForceLogin(self.owner, self.client):
             response = self.client.post("/api/tasks", data=data, format="json")
-            assert response.status_code == status.HTTP_201_CREATED, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
             tid = response.data["id"]
 
             response = self.client.post("/api/tasks/%s/data" % tid, data=image_data)
-            assert response.status_code == status.HTTP_202_ACCEPTED, response.status_code
+            self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
             response = self.client.get("/api/tasks/%s" % tid)
             task = response.data
@@ -7773,9 +7828,9 @@ class TaskChangeCloudStorageTestCase(_CloudStorageTestBase):
 
         with ForceLogin(self.owner, self.client):
             response = self.client.get(f"/api/tasks/{task_id}/data/meta")
-            assert response.status_code == status.HTTP_200_OK
-            assert response.json()["storage"] == "cloud_storage"
-            assert response.json()["cloud_storage_id"] == self.cloud_storage_id_1
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["storage"], "cloud_storage")
+            self.assertEqual(response.json()["cloud_storage_id"], self.cloud_storage_id_1)
 
             self.client.get(f"/api/tasks/{task_id}/preview")
             for quality in ["compressed", "original"]:
@@ -7783,7 +7838,7 @@ class TaskChangeCloudStorageTestCase(_CloudStorageTestBase):
                     url = f"/api/tasks/{task_id}/data?type=frame&quality={quality}&number={frame}"
                     self.client.get(url)
 
-            assert len(get_cache_keys()) > 0
+            self.assertGreater(len(get_cache_keys()), 0)
 
             response = self.client.patch(
                 f"/api/tasks/{task_id}/data/meta",
@@ -7833,3 +7888,212 @@ class TaskChangeCloudStorageTestCase(_CloudStorageTestBase):
                 response.status_code,
                 response.content,
             )
+
+
+class TaskJobLimitAPITestCase(ApiTestBase):
+    """
+    Tests for MAX_JOBS_PER_TASK validation at the REST API level
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.error_message = "Too many jobs would be created for the task"
+
+    @classmethod
+    def setUpTestData(cls):
+        create_db_users(cls)
+
+    def _create_task(self, segment_size: int, img_size: int, consensus_replicas: int | None = None):
+        data = {
+            "name": "test_for_job_limit",
+            "labels": [{"name": "car"}],
+            "segment_size": segment_size,
+        }
+
+        if consensus_replicas:
+            data["consensus_replicas"] = consensus_replicas
+
+        image_files = {}
+        for i in range(img_size):
+            image_files[f"client_files[{i}]"] = generate_image_file(f"test_{i}.jpg")
+
+        image_data = {
+            **image_files,
+            "image_quality": 75,
+        }
+
+        with ForceLogin(self.admin, self.client):
+            response = self.client.post("/api/tasks", data=data, format="json")
+            if response.status_code != status.HTTP_201_CREATED:
+                return response
+
+            tid = response.data["id"]
+            response = self.client.post(f"/api/tasks/{tid}/data", data=image_data)
+
+            rq_id = response.data["rq_id"]
+            response = self.client.get(f"/api/requests/{rq_id}")
+            return response
+
+    def _create_gt_job(self, task_id: int):
+        data = {
+            "type": "ground_truth",
+            "task_id": task_id,
+            "frame_selection_method": "random_uniform",
+            "frame_count": 10,
+        }
+
+        with ForceLogin(self.admin, self.client):
+            response = self.client.post("/api/jobs", data=data, format="json")
+            return response
+
+    @override_settings(MAX_JOBS_PER_TASK=5)
+    def test_create_task_within_job_limit(self):
+        response = self._create_task(
+            segment_size=10,
+            img_size=50,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], RequestStatus.FINISHED)
+
+        task_id = Task.objects.latest("id").id
+        job_count = Job.objects.filter(segment__task_id=task_id).count()
+        self.assertEqual(job_count, 5)
+
+    @override_settings(MAX_JOBS_PER_TASK=10)
+    def test_create_task_exceeds_job_limit(self):
+        response = self._create_task(
+            segment_size=10,
+            img_size=101,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], RequestStatus.FAILED)
+        self.assertIn(self.error_message, response.data["message"])
+
+        task_id = Task.objects.latest("id").id
+        job_count = Job.objects.filter(segment__task_id=task_id).count()
+        self.assertEqual(job_count, 0)
+
+    @override_settings(MAX_JOBS_PER_TASK=10)
+    def test_gt_jobs_are_not_affected_by_job_limit(self):
+        response = self._create_task(
+            segment_size=10,
+            img_size=100,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], RequestStatus.FINISHED)
+
+        task_id = Task.objects.latest("id").id
+        response = self._create_gt_job(task_id)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        job_count = Job.objects.filter(segment__task_id=task_id).count()
+        self.assertEqual(job_count, 11)
+
+    @override_settings(MAX_JOBS_PER_TASK=30)
+    def test_create_task_with_consensus_exactly_at_job_limit(self):
+        response = self._create_task(
+            segment_size=10,
+            img_size=100,
+            consensus_replicas=2,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], RequestStatus.FINISHED)
+
+        task_id = Task.objects.latest("id").id
+        job_count = Job.objects.filter(segment__task_id=task_id).count()
+        self.assertEqual(job_count, 30)
+
+    @override_settings(MAX_JOBS_PER_TASK=10)
+    def test_create_task_with_consensus_exceeds_job_limit(self):
+        response = self._create_task(
+            segment_size=10,
+            img_size=100,
+            consensus_replicas=2,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], RequestStatus.FAILED)
+        self.assertIn(self.error_message, response.data["message"])
+
+        task_id = Task.objects.latest("id").id
+        job_count = Job.objects.filter(segment__task_id=task_id).count()
+        self.assertEqual(job_count, 0)
+
+
+class TestCloudStorageS3Status(_CloudStorageTestBase):
+    def setUp(self):
+        self.storage = S3CloudStorage(
+            bucket="test-bucket",
+            access_key_id="test-key",
+            secret_key="test-secret",
+        )
+
+    def test_get_status_available(self):
+        def fake_head():
+            return None
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.AVAILABLE)
+
+    def test_get_status_forbidden(self):
+        def fake_head():
+            error_response = {"Error": {"Code": "403"}}
+            raise ClientError(error_response, "head_bucket")
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.FORBIDDEN)
+
+    def test_get_status_not_found(self):
+        def fake_head():
+            error_response = {"Error": {"Code": "404"}}
+            raise ClientError(error_response, "head_bucket")
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.NOT_FOUND)
+
+    def test_get_status_endpoint_error(self):
+        def fake_head():
+            raise EndpointConnectionError(endpoint_url="https://fake-url")
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.NOT_FOUND)
+
+
+class TestCloudStorageAzureStatus(_CloudStorageTestBase):
+    def setUp(self):
+        self.storage = AzureBlobCloudStorage(
+            container="test-container",
+            account_name="test-account",
+            sas_token="test-sas-token",
+        )
+
+    def test_get_status_available(self):
+        def fake_head():
+            return None
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.AVAILABLE)
+
+    def test_get_status_forbidden(self):
+        def fake_head():
+            err = HttpResponseError(message="Forbidden", response=None)
+            err.status_code = 403
+            raise err
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.FORBIDDEN)
+
+    def test_get_status_not_found(self):
+        def fake_head():
+            err = HttpResponseError(message="Not Found", response=None)
+            err.status_code = 404
+            raise err
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.NOT_FOUND)
+
+    def test_get_status_endpoint_error(self):
+        def fake_head():
+            raise ServiceRequestError(message="Endpoint error")
+
+        self.storage._head = fake_head
+        self.assertEqual(self.storage.get_status(), Status.NOT_FOUND)
