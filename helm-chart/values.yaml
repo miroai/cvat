@@ -147,10 +147,16 @@ cvat:
         extraArgs: []
     replicas: 1
     image: cvat/server
-    tag: v2.60.0
+    tag: v2.61.0
     imagePullPolicy: Always
     permissionFix:
       enabled: true
+      image: busybox
+      tag: 1.36.1
+      imagePullPolicy: IfNotPresent
+      # commandOverride: []
+      paths:
+        - /home/django
     service:
       annotations: {}
       spec:
@@ -169,7 +175,7 @@ cvat:
   frontend:
     replicas: 1
     image: cvat/ui
-    tag: v2.60.0
+    tag: v2.61.0
     imagePullPolicy: Always
     labels: {}
     #  test: test
