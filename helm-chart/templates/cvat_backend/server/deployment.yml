@@ -20,7 +20,7 @@ metadata:
 spec:
   replicas: {{ $localValues.replicas }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
   selector:
     matchLabels:
       {{- include "cvat.selectorLabels" . | nindent 6 }}
