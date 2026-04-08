@@ -24,7 +24,7 @@ class TestTUSUpload:
     def fxt_task(self):
         """Fixture to create a task for TUS upload tests"""
         with make_api_client(self._USERNAME) as api_client:
-            (task, response) = api_client.tasks_api.create({"name": "test TUS upload"})
+            task, response = api_client.tasks_api.create({"name": "test TUS upload"})
             assert response.status == HTTPStatus.CREATED
             return task
 
@@ -189,3 +189,53 @@ class TestTUSUpload:
         response = self._upload_chunk(location, 1000, oversized_chunk, check_status=False)
 
         assert response.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+
+    def test_get_upload_offset_after_complete_upload(self, fxt_task):
+        """Test uploading a complete file in one chunk"""
+        task = fxt_task
+
+        image_file = generate_image_file("test_image.jpg", size=(100, 100))
+        image_data = image_file.getvalue()
+        file_size = len(image_data)
+
+        location = self._start_upload(task.id, file_size, "test_image.jpg")
+        current_offset = self._get_upload_offset(location)
+        assert current_offset == 0
+        response = self._upload_chunk(location, 0, image_data)
+
+        assert response.status == HTTPStatus.NO_CONTENT
+        assert int(response.headers.get("Upload-Offset")) == file_size
+
+        # After completing the download, the HEAD request should return 404.
+        head_response = self._call_tus_endpoint(
+            "HEAD",
+            location,
+            headers={"Tus-Resumable": "1.0.0"},
+            check_status=False,
+        )
+        assert head_response.status == HTTPStatus.NOT_FOUND
+        # We verify that tus_file.meta_file.init_from_file() runs correctly after data validation.
+        # was 500 (Internal Server Error) because tus_file.meta_file.init_from_file() was called before data validation.
+
+    def test_upload_without_trailing_slash(self, fxt_task):
+        """Test uploading without the trailing slash in the initial URL."""
+        task = fxt_task
+
+        response = self._call_tus_endpoint(
+            "POST",
+            BASE_URL + f"/api/tasks/{task.id}/data",
+            headers={
+                "Upload-Length": "1000",
+                "Upload-Metadata": f"filename {base64.b64encode('test_image.jpg'.encode()).decode()}",
+                "Tus-Resumable": "1.0.0",
+            },
+        )
+
+        assert response.status == HTTPStatus.CREATED
+        location = response.headers.get("Location")
+        assert location is not None
+
+        response = self._upload_chunk(location, 0, b"xxxxx")
+
+        assert response.status == HTTPStatus.NO_CONTENT
+        assert int(response.headers.get("Upload-Offset")) == 5

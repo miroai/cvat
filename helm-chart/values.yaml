@@ -10,7 +10,6 @@ fullnameOverride: ""
 cvat:
   ingress:
     annotations: {}
-
   backend:
     labels: {}
     annotations: {}
@@ -148,10 +147,13 @@ cvat:
         extraArgs: []
     replicas: 1
     image: cvat/server
-    tag: v2.54.0-miroai
+    tag: v2.62.0-miroai
     imagePullPolicy: Always
     permissionFix:
       enabled: true
+      image: busybox
+      tag: 1.36.1
+      imagePullPolicy: IfNotPresent
       # commandOverride: []
       paths:
         - /home/django
@@ -173,7 +175,7 @@ cvat:
   frontend:
     replicas: 1
     image: cvat/ui
-    tag: v2.54.0-miroai
+    tag: v2.62.0-miroai
     imagePullPolicy: Always
     labels: {}
     #  test: test
@@ -224,7 +226,7 @@ cvat:
   opa:
     replicas: 1
     image: openpolicyagent/opa
-    tag: 0.63.0
+    tag: 1.12.2
     imagePullPolicy: IfNotPresent
     labels: {}
     #  test: test

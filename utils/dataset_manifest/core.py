@@ -8,12 +8,13 @@ import json
 import os
 from abc import ABC, abstractmethod
 from bisect import bisect_left, insort
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from enum import Enum
 from inspect import isgenerator
 from io import StringIO
 from itertools import islice
 from json.decoder import JSONDecodeError
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any
 
 import av
@@ -402,9 +403,9 @@ class _Manifest:
     VERSION = SupportedVersion.V1_1
     TYPE: str  # must be set externally
 
-    def __init__(self, path, upload_dir=None):
+    def __init__(self, path: Path, upload_dir: Path | None = None) -> None:
         assert path, "A path to manifest file not found"
-        self._path = os.path.join(path, self.FILE_NAME) if os.path.isdir(path) else path
+        self._path = path / self.FILE_NAME if path.is_dir() else path
         self._upload_dir = upload_dir
 
     @property
@@ -413,11 +414,7 @@ class _Manifest:
 
     @property
     def name(self):
-        return (
-            os.path.basename(self._path)
-            if not self._upload_dir
-            else os.path.relpath(self._path, self._upload_dir)
-        )
+        return self._path.relative_to(self._upload_dir) if self._upload_dir else self._path.name
 
     def get_header_lines_count(self) -> int:
         if self.TYPE == "video":
@@ -432,9 +429,9 @@ class _Manifest:
 class _Index:
     FILE_NAME = "index.json"
 
-    def __init__(self, path):
-        assert path and os.path.isdir(path), "No index directory path"
-        self._path = os.path.join(path, self.FILE_NAME)
+    def __init__(self, path: Path) -> None:
+        assert path and path.is_dir(), "No index directory path"
+        self._path = path / self.FILE_NAME
         self._index = {}
 
     @property
@@ -454,8 +451,8 @@ class _Index:
     def remove(self):
         os.remove(self._path)
 
-    def create(self, manifest, *, skip):
-        assert os.path.exists(manifest), "A manifest file not exists, index cannot be created"
+    def create(self, manifest: Path, *, skip: int) -> None:
+        assert manifest.exists(), "A manifest file not exists, index cannot be created"
         with open(manifest, "r+") as manifest_file:
             while skip:
                 manifest_file.readline()
@@ -470,8 +467,8 @@ class _Index:
                     position = manifest_file.tell()
                 line = manifest_file.readline()
 
-    def partial_update(self, manifest, number):
-        assert os.path.exists(manifest), "A manifest file not exists, index cannot be updated"
+    def partial_update(self, manifest: Path, number: int) -> None:
+        assert manifest.exists(), "A manifest file not exists, index cannot be updated"
         with open(manifest, "r+") as manifest_file:
             manifest_file.seek(self._index[number])
             line = manifest_file.readline()
@@ -512,9 +509,9 @@ class _ManifestManager(ABC):
                     f"'{item}' is required, but not found"
                 )
 
-    def __init__(self, path, create_index, upload_dir=None):
+    def __init__(self, path: Path, create_index: bool, upload_dir: Path | None = None) -> None:
         self._manifest = _Manifest(path, upload_dir)
-        self._index = _Index(os.path.dirname(self._manifest.path))
+        self._index = _Index(self._manifest.path.parent)
         self._reader = None
         self._create_index = create_index
 
@@ -542,7 +539,7 @@ class _ManifestManager(ABC):
                 return parsed_properties
 
     def init_index(self):
-        if os.path.exists(self._index.path):
+        if self._index.path.exists():
             self._index.load()
         else:
             self._index.create(self._manifest.path, skip=self._manifest.get_header_lines_count())
@@ -550,7 +547,7 @@ class _ManifestManager(ABC):
                 self._index.dump()
 
     def reset_index(self):
-        if self._create_index and os.path.exists(self._index.path):
+        if self._create_index and self._index.path.exists():
             self._index.remove()
 
     def set_index(self):
@@ -559,8 +556,7 @@ class _ManifestManager(ABC):
 
     def remove(self):
         self.reset_index()
-        if os.path.exists(self.manifest.path):
-            os.remove(self.manifest.path)
+        self.manifest.path.unlink(missing_ok=True)
 
     @abstractmethod
     def create(self, content=None, _tqdm=None): ...
@@ -608,18 +604,15 @@ class _ManifestManager(ABC):
     @abstractmethod
     def data(self): ...
 
-    @abstractmethod
-    def get_subset(self, subset_names): ...
-
     @property
     def exists(self):
-        return os.path.exists(self._manifest.path)
+        return self._manifest.path.exists()
 
 
 class VideoManifestManager(_ManifestManager):
     _required_item_attributes = {"number", "pts"}
 
-    def __init__(self, manifest_path, create_index=True):
+    def __init__(self, manifest_path: Path, create_index: bool = True) -> None:
         super().__init__(manifest_path, create_index)
         setattr(self._manifest, "TYPE", "video")
         self.BASE_INFORMATION["properties"] = 3
@@ -692,12 +685,9 @@ class VideoManifestManager(_ManifestManager):
     def chapters(self):
         return self["properties"].get("chapters", [])
 
-    def get_subset(self, subset_names):
-        raise NotImplementedError()
-
 
 class VideoManifestValidator(VideoManifestManager):
-    def __init__(self, source_path: Openable, manifest_path: str) -> None:
+    def __init__(self, source_path: Openable, manifest_path: Path) -> None:
         self._source_path = source_path
         super().__init__(manifest_path)
 
@@ -746,7 +736,9 @@ class ImageProperties(dict):
 class ImageManifestManager(_ManifestManager):
     _required_item_attributes = {"name", "extension"}
 
-    def __init__(self, manifest_path, upload_dir=None, create_index=True):
+    def __init__(
+        self, manifest_path: Path, upload_dir: Path | None = None, create_index: bool = True
+    ) -> None:
         super().__init__(manifest_path, create_index, upload_dir)
         setattr(self._manifest, "TYPE", "images")
 
@@ -795,11 +787,13 @@ class ImageManifestManager(_ManifestManager):
     def data(self):
         return (f"{image.full_name}" for _, image in self)
 
-    def get_subset(self, subset_names):
+    def get_subset(
+        self, subset_names: Sequence[PurePath]
+    ) -> tuple[list[int], list[dict[str, Any]]]:
         index_list = []
         subset = []
         for _, image in self:
-            image_name = f"{image.full_name}"
+            image_name = PurePosixPath(image.full_name)
             if image_name in subset_names:
                 index_list.append(subset_names.index(image_name))
                 properties = {
@@ -907,7 +901,7 @@ class ImageManifestManager(_ManifestManager):
 
 
 class _BaseManifestValidator(ABC):
-    def __init__(self, full_manifest_path):
+    def __init__(self, full_manifest_path: Path) -> None:
         self._manifest = _Manifest(full_manifest_path)
 
     def validate(self):
@@ -994,15 +988,15 @@ class _DatasetManifestStructureValidator(_BaseManifestValidator):
             raise InvalidManifestError("Incorrect height field")
 
 
-def is_manifest(full_manifest_path):
+def is_manifest(full_manifest_path: Path) -> bool:
     return is_video_manifest(full_manifest_path) or is_dataset_manifest(full_manifest_path)
 
 
-def is_video_manifest(full_manifest_path):
+def is_video_manifest(full_manifest_path: Path) -> bool:
     validator = _VideoManifestStructureValidator(full_manifest_path)
     return validator.validate()
 
 
-def is_dataset_manifest(full_manifest_path):
+def is_dataset_manifest(full_manifest_path: Path) -> bool:
     validator = _DatasetManifestStructureValidator(full_manifest_path)
     return validator.validate()

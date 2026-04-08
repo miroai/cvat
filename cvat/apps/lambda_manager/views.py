@@ -476,6 +476,9 @@ class LambdaFunction:
                     "obj_bbox": data.get("obj_bbox", None),
                 }
             )
+            text_prompts = data.get("text_prompts", None)
+            if text_prompts:
+                payload["text_prompts"] = text_prompts
         elif self.kind == FunctionKind.REID:
             payload.update(
                 {
@@ -1259,17 +1262,15 @@ class FunctionViewSet(viewsets.ViewSet):
         return gateway.get(func_id).to_dict()
 
     @extend_schema(
-        description=textwrap.dedent(
-            """\
-        Allows to execute a function for immediate computation.
+        description=textwrap.dedent("""\
+            Allows to execute a function for immediate computation.
 
-        Intended for short-lived executions, useful for interactive calls.
+            Intended for short-lived executions, useful for interactive calls.
 
-        When executed for interactive annotation, the job id must be specified
-        in the 'job' input field. The task id is not required in this case,
-        but if it is specified, it must match the job task id.
-        """
-        ),
+            When executed for interactive annotation, the job id must be specified
+            in the 'job' input field. The task id is not required in this case,
+            but if it is specified, it must match the job task id.
+        """),
         request=inline_serializer(
             "OnlineFunctionCall",
             fields={
